@@ -18,7 +18,6 @@ use crate::database::repository::{NewJail, SavedRoleInput};
 use crate::services::JailService;
 use crate::services::ratelimit::{self, Lane};
 
-const ABSENT: &str = "ABSENT";
 
 /// Upper bound for a single reconciliation pass. Remaining repairs are picked up
 /// by the next sweep, so one large server cannot monopolise the event loop.
@@ -65,6 +64,60 @@ pub fn prisoner_overwrite(
                 | Permissions::ADD_REACTIONS,
         )
     }
+}
+
+/// Deletes per-member channel overwrites recorded by older builds.
+///
+/// Restrictions live entirely on the Prisoner role, so nothing writes member
+/// overwrites any more. Records jailed by an older build still carry snapshots;
+/// those overwrites are deleted instead of restored, because leaving them in
+/// place would keep a released member unable to see any channel.
+async fn remove_legacy_member_overwrites(
+    http: &HttpClient,
+    pool: &SqlitePool,
+    guild_id: Id<GuildMarker>,
+    target_id: Id<UserMarker>,
+    record_id: i64,
+) -> anyhow::Result<()> {
+    let snapshots = repository::get_overwrite_snapshots(pool, record_id).await?;
+
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+
+    let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
+        .await?
+        .models()
+        .await?;
+
+    for snapshot in snapshots {
+        let channel_id = Id::<ChannelMarker>::new(
+            snapshot
+                .channel_id
+                .parse::<u64>()
+                .context("Invalid saved channel ID")?,
+        );
+
+        if !channels.iter().any(|channel| channel.id == channel_id) {
+            continue;
+        }
+
+        if let Err(error) = ratelimit::guard(
+            Lane::Overwrite,
+            http.delete_channel_permission(channel_id).member(target_id),
+        )
+        .await
+        {
+            tracing::warn!(
+                ?error,
+                channel_id = %channel_id,
+                user_id = %target_id,
+                "Could not delete a legacy member overwrite"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn jail_member(
@@ -408,55 +461,9 @@ async fn release_member_internal(
         roles_to_restore.push(role_id);
     }
 
-    // Legacy records saved member overwrites, so restore those. Jails created
-    // since the role-only change have none and skip the channel walk entirely.
-    let snapshots = repository::get_overwrite_snapshots(pool, record.id).await?;
-
-    if !snapshots.is_empty() {
-        let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
-            .await?
-            .models()
-            .await?;
-
-        for snapshot in &snapshots {
-            let channel_id = Id::<ChannelMarker>::new(
-                snapshot
-                    .channel_id
-                    .parse::<u64>()
-                    .context("Invalid saved channel ID")?,
-            );
-
-            // Ignore channels that no longer exist.
-            if !channels.iter().any(|channel| channel.id == channel_id) {
-                continue;
-            }
-
-            if snapshot.allow_bits == ABSENT && snapshot.deny_bits == ABSENT {
-                ratelimit::guard(
-                    Lane::Overwrite,
-                    http.delete_channel_permission(channel_id).member(target_id),
-                )
-                .await?;
-                continue;
-            }
-
-            let allow_bits = snapshot.allow_bits.parse::<u64>()?;
-            let deny_bits = snapshot.deny_bits.parse::<u64>()?;
-
-            let overwrite = PermissionOverwrite {
-                allow: Some(Permissions::from_bits_retain(allow_bits)),
-                deny: Some(Permissions::from_bits_retain(deny_bits)),
-                id: target_id.cast(),
-                kind: PermissionOverwriteType::Member,
-            };
-
-            ratelimit::guard(
-                Lane::Overwrite,
-                http.update_channel_permission(channel_id, &overwrite),
-            )
-            .await?;
-        }
-    }
+    // Never touch channels here: restrictions are the Prisoner role's job.
+    // Only overwrites written by an older build are deleted.
+    remove_legacy_member_overwrites(http, pool, guild_id, target_id, record.id).await?;
 
     // Restore the original nickname.
     ratelimit::guard(
@@ -553,8 +560,8 @@ pub async fn send_moderation_log(
 }
 
 /// Expires a prisoner who has already left the server.
-/// Their roles and nickname no longer exist in the guild, but channel overwrites
-/// must still be restored before the database record is closed.
+/// Their roles and nickname no longer exist in the guild, so only overwrites left
+/// by an older build have to be cleaned up before the record is closed.
 pub async fn expire_absent_member(
     http: &HttpClient,
     pool: &SqlitePool,
@@ -568,52 +575,8 @@ pub async fn expire_absent_member(
         return Ok(None);
     };
 
-    let snapshots = repository::get_overwrite_snapshots(pool, record.id).await?;
-
-    // Legacy records only; role-only jails need no channel writes at all.
-    if !snapshots.is_empty() {
-        let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
-            .await?
-            .models()
-            .await?;
-
-        for snapshot in snapshots {
-            let channel_id = Id::<ChannelMarker>::new(
-                snapshot
-                    .channel_id
-                    .parse::<u64>()
-                    .context("Invalid saved channel ID")?,
-            );
-
-            if !channels.iter().any(|channel| channel.id == channel_id) {
-                continue;
-            }
-
-            if snapshot.allow_bits == ABSENT && snapshot.deny_bits == ABSENT {
-                ratelimit::guard(
-                    Lane::Overwrite,
-                    http.delete_channel_permission(channel_id).member(target_id),
-                )
-                .await?;
-            } else {
-                let allow = Permissions::from_bits_retain(snapshot.allow_bits.parse::<u64>()?);
-                let deny = Permissions::from_bits_retain(snapshot.deny_bits.parse::<u64>()?);
-
-                let overwrite = PermissionOverwrite {
-                    allow: Some(allow),
-                    deny: Some(deny),
-                    id: target_id.cast(),
-                    kind: PermissionOverwriteType::Member,
-                };
-
-                ratelimit::guard(
-                    Lane::Overwrite,
-                    http.update_channel_permission(channel_id, &overwrite),
-                )
-                .await?;
-            }
-        }
-    }
+    // Only overwrites left by an older build are removed; nothing writes them.
+    remove_legacy_member_overwrites(http, pool, guild_id, target_id, record.id).await?;
 
     let released = JailService::new(pool.clone())
         .complete_release(&guild_string, &user_string, "SYSTEM", true)
