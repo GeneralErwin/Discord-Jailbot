@@ -1,11 +1,13 @@
 use anyhow::{Context, bail};
 use sqlx::SqlitePool;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::commands::moderation::{
     JailCommand, JailConfigCommand, JailInfoCommand, PrisonersCommand, SetLogsCommand,
     UnjailCommand,
 };
+use crate::services::ratelimit::{self, Lane};
 
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
 use twilight_http::Client as HttpClient;
@@ -57,7 +59,20 @@ fn manage_channels_permissions() -> Permissions {
     Permissions::MANAGE_CHANNELS
 }
 
-pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
+/// How often queued repair work is flushed.
+const REPAIR_TICK: Duration = Duration::from_secs(3);
+
+/// Minimum gap between two event-triggered repair sweeps of the same server.
+const REPAIR_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long a server is remembered after its last repair sweep.
+const REPAIR_HISTORY: Duration = Duration::from_secs(600);
+
+pub async fn run(
+    token: String,
+    pool: SqlitePool,
+    started: std::time::Instant,
+) -> anyhow::Result<()> {
     let http = HttpClient::new(token.clone());
 
     let application_id = http.current_user_application().await?.model().await?.id;
@@ -78,7 +93,10 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
         .set_global_commands(&commands)
         .await?;
 
-    tracing::info!("Global slash commands registered");
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Global slash commands registered"
+    );
 
     let mut shard = Shard::new(
         ShardId::ONE,
@@ -88,6 +106,13 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
 
     let mut maintenance_tick = tokio::time::interval(Duration::from_secs(30));
     let mut reconciliation_tick = tokio::time::interval(Duration::from_secs(300));
+
+    // Gateway events only mark a server as dirty. Repairs are coalesced and
+    // paced, so a burst of member or channel changes cannot turn into one full
+    // guild sweep per event.
+    let mut repair_tick = tokio::time::interval(REPAIR_TICK);
+    let mut pending_repairs: HashSet<u64> = HashSet::new();
+    let mut last_repair: HashMap<u64, Instant> = HashMap::new();
 
     tracing::info!("Connecting to Discord...");
 
@@ -100,9 +125,13 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
             }
 
             _ = reconciliation_tick.tick() => {
-                if let Err(error) = reconcile_all_guilds(&http, &pool).await {
-                    tracing::error!(?error, "Periodic jail reconciliation failed");
+                if let Err(error) = queue_configured_guilds(&pool, &mut pending_repairs).await {
+                    tracing::error!(?error, "Could not queue periodic jail reconciliation");
                 }
+            }
+
+            _ = repair_tick.tick() => {
+                flush_repairs(&http, &pool, &mut pending_repairs, &mut last_repair).await;
             }
 
             event = shard.next_event(EventTypeFlags::all()) => {
@@ -113,15 +142,30 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
 
                 match event {
                     Ok(Event::Ready(_)) => {
-                        tracing::info!("Connected to Discord successfully");
+                        tracing::info!(
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Connected to Discord successfully"
+                        );
 
-                        if let Err(error) = reconcile_all_guilds(&http, &pool).await {
-                            tracing::error!(?error, "Startup jail reconciliation failed");
+                        // Queue startup repair instead of sweeping inline, so the
+                        // gateway loop stays responsive while it converges.
+                        match queue_configured_guilds(&pool, &mut pending_repairs).await {
+                            Ok(queued) => {
+                                tracing::info!(queued, "Queued startup jail reconciliation")
+                            }
+                            Err(error) => {
+                                tracing::error!(?error, "Could not queue startup jail reconciliation")
+                            }
                         }
 
                         if let Err(error) = process_due_jails(&http, &pool).await {
                             tracing::error!(?error, "Startup automatic release cycle failed");
                         }
+
+                        tracing::info!(
+                            boot_ms = started.elapsed().as_millis() as u64,
+                            "Boot complete"
+                        );
                     }
 
                     Ok(Event::InteractionCreate(event)) => {
@@ -161,18 +205,14 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
                     }
 
                     Ok(Event::MemberAdd(event)) => {
-                        if let Err(error) =
-                            crate::services::discord_moderation::reconcile_guild(
-                                &http, &pool, event.guild_id
-                            ).await
-                        {
-                            tracing::error!(
-                                ?error,
-                                guild_id = %event.guild_id,
-                                user_id = %event.member.user.id,
-                                "Could not reapply jail restrictions to a returning member"
-                            );
-                        }
+                        // A returning prisoner is re-jailed by the next repair pass.
+                        pending_repairs.insert(event.guild_id.get());
+
+                        tracing::debug!(
+                            guild_id = %event.guild_id,
+                            user_id = %event.member.user.id,
+                            "Queued jail repair for a member who joined"
+                        );
                     }
 
                     Ok(Event::MemberUpdate(event)) => {
@@ -187,18 +227,13 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
                         .await
                         {
                             Ok(Some(_)) => {
-                                if let Err(error) =
-                                    crate::services::discord_moderation::reconcile_guild(
-                                        &http, &pool, guild_id
-                                    ).await
-                                {
-                                    tracing::error!(
-                                        ?error,
-                                        guild_id = %guild_id,
-                                        user_id = %user_id,
-                                        "Could not repair a jailed member's changed roles"
-                                    );
-                                }
+                                pending_repairs.insert(guild_id.get());
+
+                                tracing::debug!(
+                                    guild_id = %guild_id,
+                                    user_id = %user_id,
+                                    "Queued jail repair after a jailed member edit"
+                                );
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -209,35 +244,47 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
 
                     Ok(Event::ChannelCreate(event)) => {
                         if let Some(guild_id) = event.0.guild_id {
-                            if let Err(error) =
-                                crate::services::discord_moderation::reconcile_guild(
-                                    &http, &pool, guild_id
-                                ).await
-                            {
-                                tracing::error!(
-                                    ?error,
-                                    guild_id = %guild_id,
-                                    channel_id = %event.0.id,
-                                    "Could not apply jail permissions to a new channel"
-                                );
-                            }
+                            pending_repairs.insert(guild_id.get());
+
+                            tracing::debug!(
+                                guild_id = %guild_id,
+                                channel_id = %event.0.id,
+                                "Queued jail repair for a new channel"
+                            );
                         }
                     }
 
                     Ok(Event::ChannelUpdate(event)) => {
                         if let Some(guild_id) = event.0.guild_id {
-                            if let Err(error) =
-                                crate::services::discord_moderation::reconcile_guild(
-                                    &http, &pool, guild_id
-                                ).await
-                            {
-                                tracing::error!(
-                                    ?error,
-                                    guild_id = %guild_id,
-                                    channel_id = %event.0.id,
-                                    "Could not repair jail permissions after a channel update"
-                                );
-                            }
+                            pending_repairs.insert(guild_id.get());
+
+                            tracing::debug!(
+                                guild_id = %guild_id,
+                                channel_id = %event.0.id,
+                                "Queued jail repair after a channel update"
+                            );
+                        }
+                    }
+
+                    Ok(Event::ChannelDelete(event)) => {
+                        let channel_id = event.0.id.to_string();
+
+                        match crate::database::repository::forget_channel_snapshots(
+                            &pool, &channel_id,
+                        )
+                        .await
+                        {
+                            Ok(0) => {}
+                            Ok(removed) => tracing::debug!(
+                                channel_id = %event.0.id,
+                                removed,
+                                "Discarded permission snapshots for a deleted channel"
+                            ),
+                            Err(error) => tracing::warn!(
+                                ?error,
+                                channel_id = %event.0.id,
+                                "Could not discard permission snapshots for a deleted channel"
+                            ),
                         }
                     }
 
@@ -254,27 +301,68 @@ pub async fn run(token: String, pool: SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reconciles every server that has completed jail setup.
-/// This is run at startup and periodically to recover from partial failures.
-async fn reconcile_all_guilds(http: &HttpClient, pool: &SqlitePool) -> anyhow::Result<()> {
+/// Queues a repair pass for every server that has completed jail setup.
+async fn queue_configured_guilds(
+    pool: &SqlitePool,
+    pending: &mut HashSet<u64>,
+) -> anyhow::Result<usize> {
     let configs = crate::database::config_repository::list_guild_configs(pool).await?;
+    let mut queued = 0_usize;
 
     for config in configs {
         if !config.setup_complete {
             continue;
         }
 
-        let guild_id = match config.guild_id.parse::<u64>() {
-            Ok(value) => Id::<GuildMarker>::new(value),
+        match config.guild_id.parse::<u64>() {
+            Ok(raw_guild_id) => {
+                pending.insert(raw_guild_id);
+                queued += 1;
+            }
             Err(error) => {
                 tracing::error!(
                     ?error,
                     guild_id = %config.guild_id,
                     "Skipping configuration with invalid guild ID"
                 );
-                continue;
             }
-        };
+        }
+    }
+
+    Ok(queued)
+}
+
+/// Flushes the coalesced repair queue.
+///
+/// Each server is repaired at most once per [`REPAIR_INTERVAL`], so an event
+/// storm collapses into a single bounded sweep instead of one sweep per event.
+async fn flush_repairs(
+    http: &HttpClient,
+    pool: &SqlitePool,
+    pending: &mut HashSet<u64>,
+    last_repair: &mut HashMap<u64, Instant>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+
+    let now = Instant::now();
+
+    let due: Vec<u64> = pending
+        .iter()
+        .copied()
+        .filter(|guild_id| {
+            last_repair
+                .get(guild_id)
+                .is_none_or(|previous| now.duration_since(*previous) >= REPAIR_INTERVAL)
+        })
+        .collect();
+
+    for raw_guild_id in due {
+        pending.remove(&raw_guild_id);
+        last_repair.insert(raw_guild_id, Instant::now());
+
+        let guild_id = Id::<GuildMarker>::new(raw_guild_id);
 
         if let Err(error) =
             crate::services::discord_moderation::reconcile_guild(http, pool, guild_id).await
@@ -282,12 +370,12 @@ async fn reconcile_all_guilds(http: &HttpClient, pool: &SqlitePool) -> anyhow::R
             tracing::error!(
                 ?error,
                 guild_id = %guild_id,
-                "Guild jail reconciliation failed"
+                "Event-triggered jail reconciliation failed"
             );
         }
     }
 
-    Ok(())
+    last_repair.retain(|_, previous| now.duration_since(*previous) < REPAIR_HISTORY);
 }
 
 /// Finds due sentences and releases them automatically.
@@ -1026,9 +1114,12 @@ async fn configure_jail_channel(
             }
         };
 
-        http.update_channel_permission(channel.id, &overwrite)
-            .await
-            .with_context(|| format!("Failed to update permissions for channel {}", channel.id))?;
+        ratelimit::guard(
+            Lane::Overwrite,
+            http.update_channel_permission(channel.id, &overwrite),
+        )
+        .await
+        .with_context(|| format!("Failed to update permissions for channel {}", channel.id))?;
 
         updated_count += 1;
     }
@@ -1063,9 +1154,12 @@ async fn respond(
         }),
     };
 
-    http.interaction(application_id)
-        .create_response(interaction.id, &interaction.token, &response)
-        .await?;
+    ratelimit::guard(
+        Lane::Interaction,
+        http.interaction(application_id)
+            .create_response(interaction.id, &interaction.token, &response),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1079,9 +1173,12 @@ async fn defer_interaction(
         data: None,
     };
 
-    http.interaction(application_id)
-        .create_response(interaction.id, &interaction.token, &response)
-        .await?;
+    ratelimit::guard(
+        Lane::Interaction,
+        http.interaction(application_id)
+            .create_response(interaction.id, &interaction.token, &response),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1092,10 +1189,13 @@ async fn edit_deferred_response(
     interaction: &Interaction,
     content: &str,
 ) -> anyhow::Result<()> {
-    http.interaction(application_id)
-        .update_response(&interaction.token)
-        .content(Some(content))
-        .await?;
+    ratelimit::guard(
+        Lane::Message,
+        http.interaction(application_id)
+            .update_response(&interaction.token)
+            .content(Some(content)),
+    )
+    .await?;
 
     Ok(())
 }

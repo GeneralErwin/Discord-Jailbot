@@ -1,6 +1,8 @@
 use crate::database::repository;
 use anyhow::{Context, bail};
 use sqlx::SqlitePool;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use twilight_http::Client as HttpClient;
 use twilight_model::{
@@ -15,8 +17,18 @@ use twilight_model::{
 
 use crate::database::repository::{NewJail, OverwriteSnapshotInput, SavedRoleInput};
 use crate::services::JailService;
+use crate::services::ratelimit::{self, Lane};
 
 const ABSENT: &str = "ABSENT";
+
+/// Upper bound for a single reconciliation pass. Remaining repairs are picked up
+/// by the next sweep, so one large server cannot monopolise the event loop.
+const MAX_WRITES_PER_PASS: usize = 120;
+const MAX_PASS_DURATION: Duration = Duration::from_secs(10);
+
+fn budget_exhausted(writes: usize, started: Instant) -> bool {
+    writes >= MAX_WRITES_PER_PASS || started.elapsed() >= MAX_PASS_DURATION
+}
 
 pub async fn jail_member(
     http: &HttpClient,
@@ -208,16 +220,22 @@ pub async fn jail_member(
 
         if let Some(role) = roles.iter().find(|role| role.id == *role_id) {
             if !role.managed {
-                http.remove_guild_member_role(guild_id, target_id, role.id)
-                    .await?;
+                ratelimit::guard(
+                    Lane::Member,
+                    http.remove_guild_member_role(guild_id, target_id, role.id),
+                )
+                .await?;
             }
         }
     }
 
     // Assign the Prisoner role.
     if !target.roles.contains(&prisoner_role_id) {
-        http.add_guild_member_role(guild_id, target_id, prisoner_role_id)
-            .await?;
+        ratelimit::guard(
+            Lane::Member,
+            http.add_guild_member_role(guild_id, target_id, prisoner_role_id),
+        )
+        .await?;
     }
 
     // Mark the member's nickname.
@@ -228,9 +246,12 @@ pub async fn jail_member(
         .take(32)
         .collect();
 
-    http.update_guild_member(guild_id, target_id)
-        .nick(Some(&jailed_nickname))
-        .await?;
+    ratelimit::guard(
+        Lane::Member,
+        http.update_guild_member(guild_id, target_id)
+            .nick(Some(&jailed_nickname)),
+    )
+    .await?;
 
     // Apply member-specific restrictions in every channel.
     for channel in &channels {
@@ -258,8 +279,11 @@ pub async fn jail_member(
             kind: PermissionOverwriteType::Member,
         };
 
-        http.update_channel_permission(channel.id, &overwrite)
-            .await?;
+        ratelimit::guard(
+            Lane::Overwrite,
+            http.update_channel_permission(channel.id, &overwrite),
+        )
+        .await?;
     }
 
     tracing::info!(
@@ -423,9 +447,11 @@ async fn release_member_internal(
         }
 
         if snapshot.allow_bits == "ABSENT" && snapshot.deny_bits == "ABSENT" {
-            http.delete_channel_permission(channel_id)
-                .member(target_id)
-                .await?;
+            ratelimit::guard(
+                Lane::Overwrite,
+                http.delete_channel_permission(channel_id).member(target_id),
+            )
+            .await?;
             continue;
         }
 
@@ -439,27 +465,39 @@ async fn release_member_internal(
             kind: PermissionOverwriteType::Member,
         };
 
-        http.update_channel_permission(channel_id, &overwrite)
-            .await?;
+        ratelimit::guard(
+            Lane::Overwrite,
+            http.update_channel_permission(channel_id, &overwrite),
+        )
+        .await?;
     }
 
     // Restore the original nickname.
-    http.update_guild_member(guild_id, target_id)
-        .nick(record.original_nickname.as_deref())
-        .await?;
+    ratelimit::guard(
+        Lane::Member,
+        http.update_guild_member(guild_id, target_id)
+            .nick(record.original_nickname.as_deref()),
+    )
+    .await?;
 
     // Restore the saved roles.
     for role_id in roles_to_restore {
         if !target.roles.contains(&role_id) {
-            http.add_guild_member_role(guild_id, target_id, role_id)
-                .await?;
+            ratelimit::guard(
+                Lane::Member,
+                http.add_guild_member_role(guild_id, target_id, role_id),
+            )
+            .await?;
         }
     }
 
     // Remove the Prisoner role last.
     if target.roles.contains(&prisoner_role_id) {
-        http.remove_guild_member_role(guild_id, target_id, prisoner_role_id)
-            .await?;
+        ratelimit::guard(
+            Lane::Member,
+            http.remove_guild_member_role(guild_id, target_id, prisoner_role_id),
+        )
+        .await?;
     }
 
     // Only mark the record released after Discord restoration succeeds.
@@ -523,7 +561,8 @@ pub async fn send_moderation_log(
             .context("Invalid configured log channel ID")?,
     );
 
-    http.create_message(channel_id).content(message).await?;
+    ratelimit::guard(Lane::Message, http.create_message(channel_id).content(message)).await?;
+
     Ok(())
 }
 
@@ -559,9 +598,11 @@ pub async fn expire_absent_member(
         }
 
         if snapshot.allow_bits == "ABSENT" && snapshot.deny_bits == "ABSENT" {
-            http.delete_channel_permission(channel_id)
-                .member(target_id)
-                .await?;
+            ratelimit::guard(
+                Lane::Overwrite,
+                http.delete_channel_permission(channel_id).member(target_id),
+            )
+            .await?;
         } else {
             let allow = Permissions::from_bits_retain(snapshot.allow_bits.parse::<u64>()?);
             let deny = Permissions::from_bits_retain(snapshot.deny_bits.parse::<u64>()?);
@@ -573,8 +614,11 @@ pub async fn expire_absent_member(
                 kind: PermissionOverwriteType::Member,
             };
 
-            http.update_channel_permission(channel_id, &overwrite)
-                .await?;
+            ratelimit::guard(
+                Lane::Overwrite,
+                http.update_channel_permission(channel_id, &overwrite),
+            )
+            .await?;
         }
     }
 
@@ -690,8 +734,27 @@ pub async fn reconcile_guild(
     }
 
     let records = repository::list_active_jails(pool, &guild_id_string).await?;
-    let channels = http.guild_channels(guild_id).await?.models().await?;
+    let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
+        .await?
+        .models()
+        .await?;
     let service = JailService::new(pool.clone());
+
+    // Which channels already have a saved snapshot per record. Loading this once
+    // keeps a converged sweep free of database writes.
+    let mut saved_channels: HashMap<i64, HashSet<String>> = HashMap::with_capacity(records.len());
+
+    for record in &records {
+        let snapshots = repository::get_overwrite_snapshots(pool, record.id).await?;
+
+        saved_channels.insert(
+            record.id,
+            snapshots
+                .into_iter()
+                .map(|snapshot| snapshot.channel_id)
+                .collect(),
+        );
+    }
 
     // First restore the member-side restrictions and remove roles that may have
     // been re-added while the bot was offline.
@@ -705,7 +768,8 @@ pub async fn reconcile_guild(
                 .context("Invalid jailed user ID")?,
         );
 
-        let target = match http.guild_member(guild_id, target_id).await {
+        let target = match ratelimit::guard(Lane::Read, http.guild_member(guild_id, target_id)).await
+        {
             Ok(response) => match response.model().await {
                 Ok(member) => Some(member),
                 Err(error) => {
@@ -754,18 +818,24 @@ pub async fn reconcile_guild(
                 );
             }
 
-            http.remove_guild_member_role(guild_id, target_id, role.id)
-                .await
-                .with_context(|| {
-                    format!("Failed to remove role `{}` from jailed member", role.name)
-                })?;
+            ratelimit::guard(
+                Lane::Member,
+                http.remove_guild_member_role(guild_id, target_id, role.id),
+            )
+            .await
+            .with_context(|| {
+                format!("Failed to remove role `{}` from jailed member", role.name)
+            })?;
             member_changed = true;
         }
 
         if !target.roles.contains(&prisoner_role_id) {
-            http.add_guild_member_role(guild_id, target_id, prisoner_role_id)
-                .await
-                .context("Failed to reapply Prisoner role during reconciliation")?;
+            ratelimit::guard(
+                Lane::Member,
+                http.add_guild_member_role(guild_id, target_id, prisoner_role_id),
+            )
+            .await
+            .context("Failed to reapply Prisoner role during reconciliation")?;
             member_changed = true;
         }
 
@@ -777,10 +847,13 @@ pub async fn reconcile_guild(
         let jailed_nickname: String = format!("[JAILED] {base_name}").chars().take(32).collect();
 
         if target.nick.as_deref() != Some(jailed_nickname.as_str()) {
-            http.update_guild_member(guild_id, target_id)
-                .nick(Some(&jailed_nickname))
-                .await
-                .context("Failed to restore jailed nickname during reconciliation")?;
+            ratelimit::guard(
+                Lane::Member,
+                http.update_guild_member(guild_id, target_id)
+                    .nick(Some(&jailed_nickname)),
+            )
+            .await
+            .context("Failed to restore jailed nickname during reconciliation")?;
             member_changed = true;
         }
 
@@ -810,9 +883,16 @@ pub async fn reconcile_guild(
     // Enforce the Prisoner role and member-specific restrictions in every
     // existing channel. Snapshots are inserted only once, before the overwrite
     // is changed, so later releases can restore the original state.
+    let pass_started = Instant::now();
     let mut updated = 0_usize;
+    let mut writes = 0_usize;
 
     for channel in &channels {
+        if budget_exhausted(writes, pass_started) {
+            break;
+        }
+
+        let channel_id_string = channel.id.to_string();
         let (role_allow, role_deny) = if channel.id == jail_channel_id {
             (
                 Permissions::VIEW_CHANNEL
@@ -852,18 +932,26 @@ pub async fn reconcile_guild(
                 kind: PermissionOverwriteType::Role,
             };
 
-            http.update_channel_permission(channel.id, &overwrite)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to repair Prisoner role permissions in channel {}",
-                        channel.id
-                    )
-                })?;
+            ratelimit::guard(
+                Lane::Overwrite,
+                http.update_channel_permission(channel.id, &overwrite),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to repair Prisoner role permissions in channel {}",
+                    channel.id
+                )
+            })?;
             updated += 1;
+            writes += 1;
         }
 
         for record in &records {
+            if budget_exhausted(writes, pass_started) {
+                break;
+            }
+
             let target_id = Id::<UserMarker>::new(
                 record
                     .user_id
@@ -885,33 +973,44 @@ pub async fn reconcile_guild(
             let snapshot_bits = current_member_overwrite
                 .map(|overwrite| (overwrite.allow.bits(), overwrite.deny.bits()));
 
-            // INSERT OR IGNORE preserves the first snapshot if this channel was
-            // already covered by the original jail operation.
-            let (allow_bits, deny_bits) = match snapshot_bits {
-                Some((allow, deny)) => (Some(allow), Some(deny)),
-                None => (None, None),
-            };
+            // A snapshot is written once, before the overwrite is first changed.
+            // Channels that already have one are skipped entirely.
+            let known_snapshot = saved_channels
+                .get(&record.id)
+                .is_some_and(|channels| channels.contains(&channel_id_string));
 
-            sqlx::query(
-                "INSERT OR IGNORE INTO member_overwrite_snapshots
-                 (jail_record_id, channel_id, allow_bits, deny_bits)
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(record.id)
-            .bind(channel.id.to_string())
-            .bind(
-                allow_bits
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "ABSENT".to_owned()),
-            )
-            .bind(
-                deny_bits
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "ABSENT".to_owned()),
-            )
-            .execute(pool)
-            .await
-            .context("Failed to save a channel overwrite before reconciliation")?;
+            if !known_snapshot {
+                let (allow_bits, deny_bits) = match snapshot_bits {
+                    Some((allow, deny)) => (Some(allow), Some(deny)),
+                    None => (None, None),
+                };
+
+                sqlx::query(
+                    "INSERT OR IGNORE INTO member_overwrite_snapshots
+                     (jail_record_id, channel_id, allow_bits, deny_bits)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(record.id)
+                .bind(&channel_id_string)
+                .bind(
+                    allow_bits
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| ABSENT.to_owned()),
+                )
+                .bind(
+                    deny_bits
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| ABSENT.to_owned()),
+                )
+                .execute(pool)
+                .await
+                .context("Failed to save a channel overwrite before reconciliation")?;
+
+                saved_channels
+                    .entry(record.id)
+                    .or_default()
+                    .insert(channel_id_string.clone());
+            }
 
             let (member_allow, member_deny) = if channel.id == jail_channel_id {
                 (
@@ -942,15 +1041,19 @@ pub async fn reconcile_guild(
                     kind: PermissionOverwriteType::Member,
                 };
 
-                http.update_channel_permission(channel.id, &overwrite)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to repair jailed member permissions in channel {}",
-                            channel.id
-                        )
-                    })?;
+                ratelimit::guard(
+                    Lane::Overwrite,
+                    http.update_channel_permission(channel.id, &overwrite),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to repair jailed member permissions in channel {}",
+                        channel.id
+                    )
+                })?;
                 updated += 1;
+                writes += 1;
             }
         }
     }

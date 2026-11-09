@@ -292,3 +292,14 @@ pub async fn get_jail_history(
 
     Ok(records)
 }
+
+/// Discards saved channel overwrites for a channel that no longer exists.
+pub async fn forget_channel_snapshots(pool: &SqlitePool, channel_id: &str) -> anyhow::Result<u64> {
+    let result = sqlx::query("DELETE FROM member_overwrite_snapshots WHERE channel_id = ?")
+        .bind(channel_id)
+        .execute(pool)
+        .await
+        .context("Failed to discard permission snapshots for a deleted channel")?;
+
+    Ok(result.rows_affected())
+}
