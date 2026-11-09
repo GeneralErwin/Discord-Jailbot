@@ -642,24 +642,37 @@ pub async fn expire_absent_member(
     Ok(released)
 }
 
+/// Result of one bounded reconciliation pass.
+#[derive(Debug, Default)]
+pub struct ReconcileOutcome {
+    /// Permission entries repaired during the pass.
+    pub updated: usize,
+    /// Whether the pass stopped at its budget with work still pending.
+    pub truncated: bool,
+}
+
 /// Reconciles one server against all active jail records.
 /// This repairs incomplete operations after restarts, API failures, channel changes,
 /// and members returning to the server.
+///
+/// A member that cannot be repaired (unmanageable role, absent from the guild,
+/// or a rejected API call) is skipped and reported, so one problem never stops
+/// the rest of the server from being sanitised.
 pub async fn reconcile_guild(
     http: &HttpClient,
     pool: &SqlitePool,
     guild_id: Id<GuildMarker>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<ReconcileOutcome> {
     let guild_id_string = guild_id.to_string();
 
     let Some(config) =
         crate::database::config_repository::get_guild_config(pool, &guild_id_string).await?
     else {
-        return Ok(0);
+        return Ok(ReconcileOutcome::default());
     };
 
     if !config.setup_complete {
-        return Ok(0);
+        return Ok(ReconcileOutcome::default());
     }
 
     let prisoner_role_id = config
@@ -760,6 +773,10 @@ pub async fn reconcile_guild(
     // been re-added while the bot was offline.
     let mut members_repaired = 0_usize;
 
+    // Records whose member is currently in the guild. Only they need channel
+    // overwrites; an absent member's overwrites are restored on expiry.
+    let mut present: HashSet<i64> = HashSet::with_capacity(records.len());
+
     for record in &records {
         let target_id = Id::<UserMarker>::new(
             record
@@ -789,6 +806,8 @@ pub async fn reconcile_guild(
             continue;
         };
 
+        present.insert(record.id);
+
         let mut member_changed = false;
 
         for role_id in &target.roles {
@@ -802,41 +821,56 @@ pub async fn reconcile_guild(
 
             if role.managed {
                 if role.permissions.contains(Permissions::ADMINISTRATOR) {
-                    bail!(
-                        "Cannot safely restrict <@{}>: they have a managed Administrator role",
-                        target_id
+                    // Never abort the sweep here: the rest of the guild still
+                    // needs sanitising. Report it so the hierarchy can be fixed.
+                    tracing::warn!(
+                        user_id = %target_id,
+                        role = %role.name,
+                        "Jailed member has a managed Administrator role; leaving it in place"
                     );
                 }
                 continue;
             }
 
             if role.position >= bot_highest_position {
-                bail!(
-                    "Cannot remove role `{}` from <@{}>: move the bot's highest role above it",
-                    role.name,
-                    target_id
+                tracing::warn!(
+                    user_id = %target_id,
+                    role = %role.name,
+                    "Role is above the bot's highest role; move the bot higher to remove it"
                 );
+                continue;
             }
 
-            ratelimit::guard(
+            match ratelimit::guard(
                 Lane::Member,
                 http.remove_guild_member_role(guild_id, target_id, role.id),
             )
             .await
-            .with_context(|| {
-                format!("Failed to remove role `{}` from jailed member", role.name)
-            })?;
-            member_changed = true;
+            {
+                Ok(_) => member_changed = true,
+                Err(error) => tracing::warn!(
+                    ?error,
+                    user_id = %target_id,
+                    role = %role.name,
+                    "Could not remove a role from a jailed member"
+                ),
+            }
         }
 
         if !target.roles.contains(&prisoner_role_id) {
-            ratelimit::guard(
+            match ratelimit::guard(
                 Lane::Member,
                 http.add_guild_member_role(guild_id, target_id, prisoner_role_id),
             )
             .await
-            .context("Failed to reapply Prisoner role during reconciliation")?;
-            member_changed = true;
+            {
+                Ok(_) => member_changed = true,
+                Err(error) => tracing::warn!(
+                    ?error,
+                    user_id = %target_id,
+                    "Could not reapply the Prisoner role during reconciliation"
+                ),
+            }
         }
 
         let base_name = record
@@ -847,14 +881,20 @@ pub async fn reconcile_guild(
         let jailed_nickname: String = format!("[JAILED] {base_name}").chars().take(32).collect();
 
         if target.nick.as_deref() != Some(jailed_nickname.as_str()) {
-            ratelimit::guard(
+            match ratelimit::guard(
                 Lane::Member,
                 http.update_guild_member(guild_id, target_id)
                     .nick(Some(&jailed_nickname)),
             )
             .await
-            .context("Failed to restore jailed nickname during reconciliation")?;
-            member_changed = true;
+            {
+                Ok(_) => member_changed = true,
+                Err(error) => tracing::warn!(
+                    ?error,
+                    user_id = %target_id,
+                    "Could not restore the jailed nickname during reconciliation"
+                ),
+            }
         }
 
         if member_changed {
@@ -886,9 +926,11 @@ pub async fn reconcile_guild(
     let pass_started = Instant::now();
     let mut updated = 0_usize;
     let mut writes = 0_usize;
+    let mut truncated = false;
 
     for channel in &channels {
         if budget_exhausted(writes, pass_started) {
+            truncated = true;
             break;
         }
 
@@ -932,24 +974,32 @@ pub async fn reconcile_guild(
                 kind: PermissionOverwriteType::Role,
             };
 
-            ratelimit::guard(
+            match ratelimit::guard(
                 Lane::Overwrite,
                 http.update_channel_permission(channel.id, &overwrite),
             )
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to repair Prisoner role permissions in channel {}",
-                    channel.id
-                )
-            })?;
-            updated += 1;
-            writes += 1;
+            {
+                Ok(_) => {
+                    updated += 1;
+                    writes += 1;
+                }
+                Err(error) => tracing::warn!(
+                    ?error,
+                    channel_id = %channel.id,
+                    "Could not repair Prisoner role permissions in a channel"
+                ),
+            }
         }
 
         for record in &records {
             if budget_exhausted(writes, pass_started) {
+                truncated = true;
                 break;
+            }
+
+            if !present.contains(&record.id) {
+                continue;
             }
 
             let target_id = Id::<UserMarker>::new(
@@ -1041,19 +1091,23 @@ pub async fn reconcile_guild(
                     kind: PermissionOverwriteType::Member,
                 };
 
-                ratelimit::guard(
+                match ratelimit::guard(
                     Lane::Overwrite,
                     http.update_channel_permission(channel.id, &overwrite),
                 )
                 .await
-                .with_context(|| {
-                    format!(
-                        "Failed to repair jailed member permissions in channel {}",
-                        channel.id
-                    )
-                })?;
-                updated += 1;
-                writes += 1;
+                {
+                    Ok(_) => {
+                        updated += 1;
+                        writes += 1;
+                    }
+                    Err(error) => tracing::warn!(
+                        ?error,
+                        channel_id = %channel.id,
+                        user_id = %target_id,
+                        "Could not repair jailed member permissions in a channel"
+                    ),
+                }
             }
         }
     }
@@ -1073,5 +1127,5 @@ pub async fn reconcile_guild(
         }
     }
 
-    Ok(updated)
+    Ok(ReconcileOutcome { updated, truncated })
 }

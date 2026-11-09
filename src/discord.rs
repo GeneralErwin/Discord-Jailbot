@@ -364,14 +364,23 @@ async fn flush_repairs(
 
         let guild_id = Id::<GuildMarker>::new(raw_guild_id);
 
-        if let Err(error) =
-            crate::services::discord_moderation::reconcile_guild(http, pool, guild_id).await
-        {
-            tracing::error!(
-                ?error,
-                guild_id = %guild_id,
-                "Event-triggered jail reconciliation failed"
-            );
+        match crate::services::discord_moderation::reconcile_guild(http, pool, guild_id).await {
+            // The pass hit its budget: queue the rest for the next allowed pass
+            // instead of waiting for the periodic sweep.
+            Ok(outcome) if outcome.truncated => {
+                pending.insert(raw_guild_id);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(
+                    ?error,
+                    guild_id = %guild_id,
+                    "Event-triggered jail reconciliation failed"
+                );
+
+                // Transient failures retry on the next allowed pass.
+                pending.insert(raw_guild_id);
+            }
         }
     }
 
