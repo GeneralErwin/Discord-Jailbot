@@ -173,6 +173,26 @@ data/          (optional, if you want to keep existing records)
 
 A Windows `.exe` will not run on a Linux VPS: build on Linux, or cross-compile for it. Use `pm2` or a systemd unit to keep the binary alive; it recreates `data/` on first start.
 
+### Fast updates (no file dragging)
+
+Do not re-upload the tree with WinSCP: SFTP copies file by file, and `target/` alone is hundreds of megabytes. Because the Rust toolchain is on the server, only the source ever needs to move.
+
+One command does the upload, build and restart:
+
+```bash
+bash scripts/deploy.sh user@yourserver /opt/jailbot
+```
+
+It sends a single compressed stream (about a hundred kilobytes) and finishes with `cargo build --release` plus `pm2 restart jailbot`.
+
+If the server can reach GitHub, skip the upload entirely:
+
+```bash
+ssh user@yourserver 'cd /opt/jailbot && git pull && cargo build --release && pm2 restart jailbot --update-env'
+```
+
+If you prefer WinSCP, use **Commands → Synchronize** (or `winscp.com /command "open ..." "synchronize remote ..."`) instead of dragging: it transfers only changed files. Either way, never upload `target/` or `data/`.
+
 ## Project structure
 
 ```text
