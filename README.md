@@ -53,8 +53,8 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
-cd YOUR_REPOSITORY
+git clone https://github.com/GeneralErwin/Discord-Jailbot.git
+cd Discord-Jailbot
 ```
 
 Build the project:
