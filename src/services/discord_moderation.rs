@@ -29,6 +29,44 @@ fn budget_exhausted(writes: usize, started: Instant) -> bool {
     writes >= MAX_WRITES_PER_PASS || started.elapsed() >= MAX_PASS_DURATION
 }
 
+/// Permission overwrite the Prisoner role receives in a channel.
+///
+/// This is the single source of truth for what a prisoner may do, used by
+/// `/setjail` and by every reconciliation pass.
+///
+/// Outside the cell the role may neither see nor speak: viewing, sending,
+/// thread replies, thread creation and reactions are all denied. Inside the
+/// cell the role may read and send plain text, but nothing else.
+pub fn prisoner_overwrite(
+    channel_id: Id<ChannelMarker>,
+    jail_channel_id: Id<ChannelMarker>,
+) -> (Permissions, Permissions) {
+    if channel_id == jail_channel_id {
+        (
+            Permissions::VIEW_CHANNEL
+                | Permissions::SEND_MESSAGES
+                | Permissions::READ_MESSAGE_HISTORY,
+            Permissions::ATTACH_FILES
+                | Permissions::EMBED_LINKS
+                | Permissions::CREATE_PUBLIC_THREADS
+                | Permissions::CREATE_PRIVATE_THREADS
+                | Permissions::SEND_MESSAGES_IN_THREADS
+                | Permissions::SEND_VOICE_MESSAGES
+                | Permissions::SEND_POLLS,
+        )
+    } else {
+        (
+            Permissions::empty(),
+            Permissions::VIEW_CHANNEL
+                | Permissions::SEND_MESSAGES
+                | Permissions::SEND_MESSAGES_IN_THREADS
+                | Permissions::CREATE_PUBLIC_THREADS
+                | Permissions::CREATE_PRIVATE_THREADS
+                | Permissions::ADD_REACTIONS,
+        )
+    }
+}
+
 pub async fn jail_member(
     http: &HttpClient,
     pool: &SqlitePool,
@@ -866,22 +904,7 @@ pub async fn reconcile_guild(
             break;
         }
 
-        let (role_allow, role_deny) = if channel.id == jail_channel_id {
-            (
-                Permissions::VIEW_CHANNEL
-                    | Permissions::SEND_MESSAGES
-                    | Permissions::READ_MESSAGE_HISTORY,
-                Permissions::ATTACH_FILES
-                    | Permissions::EMBED_LINKS
-                    | Permissions::CREATE_PUBLIC_THREADS
-                    | Permissions::CREATE_PRIVATE_THREADS
-                    | Permissions::SEND_MESSAGES_IN_THREADS
-                    | Permissions::SEND_VOICE_MESSAGES
-                    | Permissions::SEND_POLLS,
-            )
-        } else {
-            (Permissions::empty(), Permissions::VIEW_CHANNEL)
-        };
+        let (role_allow, role_deny) = prisoner_overwrite(channel.id, jail_channel_id);
 
         let current_role_overwrite =
             channel

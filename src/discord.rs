@@ -1103,32 +1103,16 @@ async fn configure_jail_channel(
     let mut updated_count = 0;
 
     for channel in &channels {
-        let overwrite = if channel.id == jail_channel_id {
-            PermissionOverwrite {
-                allow: Some(
-                    Permissions::VIEW_CHANNEL
-                        | Permissions::SEND_MESSAGES
-                        | Permissions::READ_MESSAGE_HISTORY,
-                ),
-                deny: Some(
-                    Permissions::ATTACH_FILES
-                        | Permissions::EMBED_LINKS
-                        | Permissions::CREATE_PUBLIC_THREADS
-                        | Permissions::CREATE_PRIVATE_THREADS
-                        | Permissions::SEND_MESSAGES_IN_THREADS
-                        | Permissions::SEND_VOICE_MESSAGES
-                        | Permissions::SEND_POLLS,
-                ),
-                id: prisoner_role_id.cast(),
-                kind: PermissionOverwriteType::Role,
-            }
-        } else {
-            PermissionOverwrite {
-                allow: Some(Permissions::empty()),
-                deny: Some(Permissions::VIEW_CHANNEL),
-                id: prisoner_role_id.cast(),
-                kind: PermissionOverwriteType::Role,
-            }
+        let (allow, deny) = crate::services::discord_moderation::prisoner_overwrite(
+            channel.id,
+            jail_channel_id,
+        );
+
+        let overwrite = PermissionOverwrite {
+            allow: Some(allow),
+            deny: Some(deny),
+            id: prisoner_role_id.cast(),
+            kind: PermissionOverwriteType::Role,
         };
 
         ratelimit::guard(
