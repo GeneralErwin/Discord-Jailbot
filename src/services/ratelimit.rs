@@ -10,7 +10,7 @@
 //! the bot paces itself instead of waiting to be throttled, and a real 429 arms
 //! a shared cooldown that every lane respects.
 
-use std::future::Future;
+use std::future::IntoFuture;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -112,10 +112,11 @@ pub struct Permit {
 /// large loop of calls cannot burst past the global limit.
 pub async fn guard<F, T>(lane: Lane, request: F) -> Result<T, HttpError>
 where
-    F: Future<Output = Result<T, HttpError>>,
+    // Twilight request builders implement `IntoFuture`, not `Future`.
+    F: IntoFuture<Output = Result<T, HttpError>>,
 {
     let permit = reserve(lane).await;
-    let result = request.await;
+    let result = request.into_future().await;
 
     observe(&result).await;
 

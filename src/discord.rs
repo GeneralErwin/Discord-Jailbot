@@ -370,7 +370,15 @@ async fn flush_repairs(
             Ok(outcome) if outcome.truncated => {
                 pending.insert(raw_guild_id);
             }
-            Ok(_) => {}
+            Ok(outcome) => {
+                if outcome.updated > 0 {
+                    tracing::debug!(
+                        guild_id = %guild_id,
+                        updated = outcome.updated,
+                        "Jail state repaired"
+                    );
+                }
+            }
             Err(error) => {
                 tracing::error!(
                     ?error,
