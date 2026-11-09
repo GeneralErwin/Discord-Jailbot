@@ -146,4 +146,4 @@ Data is stored locally in the `data/` directory.
 
 ## License
 
-[License](https://github.com/GeneralErwin/Discord-Jailbot/blob/main/LICENSE)
+[Apache License 2.0](https://github.com/GeneralErwin/Discord-Jailbot/blob/main/LICENSE)
