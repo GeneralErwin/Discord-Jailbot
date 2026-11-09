@@ -1,0 +1,25 @@
+
+[package]
+name = "discord-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+dotenvy = "0.15"
+
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "migrate", "macros", "time"] }
+
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+twilight-gateway = "0.18"
+twilight-http = "0.18"
+twilight-model = "0.18"
+twilight-interactions = { version = "0.18", features = ["derive"] }
