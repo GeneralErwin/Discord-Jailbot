@@ -26,7 +26,7 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 
 - One active sentence per member per server, enforced by a partial unique index.
 - Original roles (with positions and restore flags) and nickname are saved before anything changes.
-- Every member-specific channel overwrite is snapshotted, so a release restores the exact previous permissions instead of guessing.
+- Restrictions are applied through the **Prisoner role** alone, so jailing costs a handful of API calls instead of one per channel. Legacy records that still hold member overwrites are restored on release.
 - The database record is written **before** Discord is modified, and a release is only marked complete **after** roles, nickname and overwrites are restored. A crash in the middle leaves a record that the next repair pass finishes.
 
 ### Automatic systems

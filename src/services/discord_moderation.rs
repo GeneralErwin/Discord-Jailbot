@@ -1,7 +1,6 @@
 use crate::database::repository;
 use anyhow::{Context, bail};
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use twilight_http::Client as HttpClient;
@@ -15,7 +14,7 @@ use twilight_model::{
     },
 };
 
-use crate::database::repository::{NewJail, OverwriteSnapshotInput, SavedRoleInput};
+use crate::database::repository::{NewJail, SavedRoleInput};
 use crate::services::JailService;
 use crate::services::ratelimit::{self, Lane};
 
@@ -160,40 +159,16 @@ pub async fn jail_member(
         });
     }
 
-    // Fetch channels and snapshot existing member overwrites.
-    let channels = http.guild_channels(guild_id).await?.models().await?;
+    // The Prisoner role already denies access to every channel and the
+    // reconciliation pass keeps that overwrite on new channels, so a jail only
+    // needs the role. This fetch just confirms the cell still exists.
+    let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
+        .await?
+        .models()
+        .await?;
 
     if !channels.iter().any(|channel| channel.id == jail_channel_id) {
         bail!("The configured jail channel no longer exists.");
-    }
-
-    let mut overwrite_snapshots = Vec::new();
-
-    for channel in &channels {
-        let existing = channel
-            .permission_overwrites
-            .as_ref()
-            .and_then(|overwrites| {
-                overwrites.iter().find(|overwrite| {
-                    overwrite.id == target_id.cast()
-                        && overwrite.kind
-                            == twilight_model::channel::permission_overwrite::PermissionOverwriteType::Member
-                })
-            });
-
-        let (allow_bits, deny_bits) = match existing {
-            Some(overwrite) => (
-                overwrite.allow.bits().to_string(),
-                overwrite.deny.bits().to_string(),
-            ),
-            None => (ABSENT.to_string(), ABSENT.to_string()),
-        };
-
-        overwrite_snapshots.push(OverwriteSnapshotInput {
-            channel_id: channel.id.to_string(),
-            allow_bits,
-            deny_bits,
-        });
     }
 
     // Create the database record BEFORE changing Discord.
@@ -207,7 +182,7 @@ pub async fn jail_member(
         release_at,
         original_nickname: target.nick.clone(),
         roles: saved_roles,
-        overwrites: overwrite_snapshots,
+        overwrites: Vec::new(),
     };
 
     let record_id = JailService::new(pool.clone()).create_record(jail).await?;
@@ -252,39 +227,6 @@ pub async fn jail_member(
             .nick(Some(&jailed_nickname)),
     )
     .await?;
-
-    // Apply member-specific restrictions in every channel.
-    for channel in &channels {
-        let (allow, deny) = if channel.id == jail_channel_id {
-            (
-                Permissions::VIEW_CHANNEL
-                    | Permissions::SEND_MESSAGES
-                    | Permissions::READ_MESSAGE_HISTORY,
-                Permissions::ATTACH_FILES
-                    | Permissions::EMBED_LINKS
-                    | Permissions::CREATE_PUBLIC_THREADS
-                    | Permissions::CREATE_PRIVATE_THREADS
-                    | Permissions::SEND_MESSAGES_IN_THREADS
-                    | Permissions::SEND_VOICE_MESSAGES
-                    | Permissions::SEND_POLLS,
-            )
-        } else {
-            (Permissions::empty(), Permissions::VIEW_CHANNEL)
-        };
-
-        let overwrite = PermissionOverwrite {
-            allow: Some(allow),
-            deny: Some(deny),
-            id: target_id.cast(),
-            kind: PermissionOverwriteType::Member,
-        };
-
-        ratelimit::guard(
-            Lane::Overwrite,
-            http.update_channel_permission(channel.id, &overwrite),
-        )
-        .await?;
-    }
 
     tracing::info!(
         guild_id = %guild_id,
@@ -428,48 +370,54 @@ async fn release_member_internal(
         roles_to_restore.push(role_id);
     }
 
-    // Restore original channel permission overwrites.
+    // Legacy records saved member overwrites, so restore those. Jails created
+    // since the role-only change have none and skip the channel walk entirely.
     let snapshots = repository::get_overwrite_snapshots(pool, record.id).await?;
 
-    let channels = http.guild_channels(guild_id).await?.models().await?;
+    if !snapshots.is_empty() {
+        let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
+            .await?
+            .models()
+            .await?;
 
-    for snapshot in &snapshots {
-        let channel_id = Id::<ChannelMarker>::new(
-            snapshot
-                .channel_id
-                .parse::<u64>()
-                .context("Invalid saved channel ID")?,
-        );
+        for snapshot in &snapshots {
+            let channel_id = Id::<ChannelMarker>::new(
+                snapshot
+                    .channel_id
+                    .parse::<u64>()
+                    .context("Invalid saved channel ID")?,
+            );
 
-        // Ignore channels that no longer exist.
-        if !channels.iter().any(|channel| channel.id == channel_id) {
-            continue;
-        }
+            // Ignore channels that no longer exist.
+            if !channels.iter().any(|channel| channel.id == channel_id) {
+                continue;
+            }
 
-        if snapshot.allow_bits == "ABSENT" && snapshot.deny_bits == "ABSENT" {
+            if snapshot.allow_bits == ABSENT && snapshot.deny_bits == ABSENT {
+                ratelimit::guard(
+                    Lane::Overwrite,
+                    http.delete_channel_permission(channel_id).member(target_id),
+                )
+                .await?;
+                continue;
+            }
+
+            let allow_bits = snapshot.allow_bits.parse::<u64>()?;
+            let deny_bits = snapshot.deny_bits.parse::<u64>()?;
+
+            let overwrite = PermissionOverwrite {
+                allow: Some(Permissions::from_bits_retain(allow_bits)),
+                deny: Some(Permissions::from_bits_retain(deny_bits)),
+                id: target_id.cast(),
+                kind: PermissionOverwriteType::Member,
+            };
+
             ratelimit::guard(
                 Lane::Overwrite,
-                http.delete_channel_permission(channel_id).member(target_id),
+                http.update_channel_permission(channel_id, &overwrite),
             )
             .await?;
-            continue;
         }
-
-        let allow_bits = snapshot.allow_bits.parse::<u64>()?;
-        let deny_bits = snapshot.deny_bits.parse::<u64>()?;
-
-        let overwrite = PermissionOverwrite {
-            allow: Some(Permissions::from_bits_retain(allow_bits)),
-            deny: Some(Permissions::from_bits_retain(deny_bits)),
-            id: target_id.cast(),
-            kind: PermissionOverwriteType::Member,
-        };
-
-        ratelimit::guard(
-            Lane::Overwrite,
-            http.update_channel_permission(channel_id, &overwrite),
-        )
-        .await?;
     }
 
     // Restore the original nickname.
@@ -583,42 +531,49 @@ pub async fn expire_absent_member(
     };
 
     let snapshots = repository::get_overwrite_snapshots(pool, record.id).await?;
-    let channels = http.guild_channels(guild_id).await?.models().await?;
 
-    for snapshot in snapshots {
-        let channel_id = Id::<ChannelMarker>::new(
-            snapshot
-                .channel_id
-                .parse::<u64>()
-                .context("Invalid saved channel ID")?,
-        );
-
-        if !channels.iter().any(|channel| channel.id == channel_id) {
-            continue;
-        }
-
-        if snapshot.allow_bits == "ABSENT" && snapshot.deny_bits == "ABSENT" {
-            ratelimit::guard(
-                Lane::Overwrite,
-                http.delete_channel_permission(channel_id).member(target_id),
-            )
+    // Legacy records only; role-only jails need no channel writes at all.
+    if !snapshots.is_empty() {
+        let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
+            .await?
+            .models()
             .await?;
-        } else {
-            let allow = Permissions::from_bits_retain(snapshot.allow_bits.parse::<u64>()?);
-            let deny = Permissions::from_bits_retain(snapshot.deny_bits.parse::<u64>()?);
 
-            let overwrite = PermissionOverwrite {
-                allow: Some(allow),
-                deny: Some(deny),
-                id: target_id.cast(),
-                kind: PermissionOverwriteType::Member,
-            };
+        for snapshot in snapshots {
+            let channel_id = Id::<ChannelMarker>::new(
+                snapshot
+                    .channel_id
+                    .parse::<u64>()
+                    .context("Invalid saved channel ID")?,
+            );
 
-            ratelimit::guard(
-                Lane::Overwrite,
-                http.update_channel_permission(channel_id, &overwrite),
-            )
-            .await?;
+            if !channels.iter().any(|channel| channel.id == channel_id) {
+                continue;
+            }
+
+            if snapshot.allow_bits == ABSENT && snapshot.deny_bits == ABSENT {
+                ratelimit::guard(
+                    Lane::Overwrite,
+                    http.delete_channel_permission(channel_id).member(target_id),
+                )
+                .await?;
+            } else {
+                let allow = Permissions::from_bits_retain(snapshot.allow_bits.parse::<u64>()?);
+                let deny = Permissions::from_bits_retain(snapshot.deny_bits.parse::<u64>()?);
+
+                let overwrite = PermissionOverwrite {
+                    allow: Some(allow),
+                    deny: Some(deny),
+                    id: target_id.cast(),
+                    kind: PermissionOverwriteType::Member,
+                };
+
+                ratelimit::guard(
+                    Lane::Overwrite,
+                    http.update_channel_permission(channel_id, &overwrite),
+                )
+                .await?;
+            }
         }
     }
 
@@ -753,29 +708,9 @@ pub async fn reconcile_guild(
         .await?;
     let service = JailService::new(pool.clone());
 
-    // Which channels already have a saved snapshot per record. Loading this once
-    // keeps a converged sweep free of database writes.
-    let mut saved_channels: HashMap<i64, HashSet<String>> = HashMap::with_capacity(records.len());
-
-    for record in &records {
-        let snapshots = repository::get_overwrite_snapshots(pool, record.id).await?;
-
-        saved_channels.insert(
-            record.id,
-            snapshots
-                .into_iter()
-                .map(|snapshot| snapshot.channel_id)
-                .collect(),
-        );
-    }
-
     // First restore the member-side restrictions and remove roles that may have
     // been re-added while the bot was offline.
     let mut members_repaired = 0_usize;
-
-    // Records whose member is currently in the guild. Only they need channel
-    // overwrites; an absent member's overwrites are restored on expiry.
-    let mut present: HashSet<i64> = HashSet::with_capacity(records.len());
 
     for record in &records {
         let target_id = Id::<UserMarker>::new(
@@ -805,8 +740,6 @@ pub async fn reconcile_guild(
         let Some(target) = target else {
             continue;
         };
-
-        present.insert(record.id);
 
         let mut member_changed = false;
 
@@ -920,9 +853,8 @@ pub async fn reconcile_guild(
         }
     }
 
-    // Enforce the Prisoner role and member-specific restrictions in every
-    // existing channel. Snapshots are inserted only once, before the overwrite
-    // is changed, so later releases can restore the original state.
+    // Enforce the Prisoner role in every existing channel. Members are kept out
+    // by the role alone, so no per-member overwrites are written here.
     let pass_started = Instant::now();
     let mut updated = 0_usize;
     let mut writes = 0_usize;
@@ -934,7 +866,6 @@ pub async fn reconcile_guild(
             break;
         }
 
-        let channel_id_string = channel.id.to_string();
         let (role_allow, role_deny) = if channel.id == jail_channel_id {
             (
                 Permissions::VIEW_CHANNEL
@@ -992,124 +923,6 @@ pub async fn reconcile_guild(
             }
         }
 
-        for record in &records {
-            if budget_exhausted(writes, pass_started) {
-                truncated = true;
-                break;
-            }
-
-            if !present.contains(&record.id) {
-                continue;
-            }
-
-            let target_id = Id::<UserMarker>::new(
-                record
-                    .user_id
-                    .parse::<u64>()
-                    .context("Invalid jailed user ID")?,
-            );
-
-            let current_member_overwrite =
-                channel
-                    .permission_overwrites
-                    .as_ref()
-                    .and_then(|overwrites| {
-                        overwrites.iter().find(|overwrite| {
-                            overwrite.id == target_id.cast()
-                                && overwrite.kind == ChannelPermissionOverwriteType::Member
-                        })
-                    });
-
-            let snapshot_bits = current_member_overwrite
-                .map(|overwrite| (overwrite.allow.bits(), overwrite.deny.bits()));
-
-            // A snapshot is written once, before the overwrite is first changed.
-            // Channels that already have one are skipped entirely.
-            let known_snapshot = saved_channels
-                .get(&record.id)
-                .is_some_and(|channels| channels.contains(&channel_id_string));
-
-            if !known_snapshot {
-                let (allow_bits, deny_bits) = match snapshot_bits {
-                    Some((allow, deny)) => (Some(allow), Some(deny)),
-                    None => (None, None),
-                };
-
-                sqlx::query(
-                    "INSERT OR IGNORE INTO member_overwrite_snapshots
-                     (jail_record_id, channel_id, allow_bits, deny_bits)
-                     VALUES (?, ?, ?, ?)",
-                )
-                .bind(record.id)
-                .bind(&channel_id_string)
-                .bind(
-                    allow_bits
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| ABSENT.to_owned()),
-                )
-                .bind(
-                    deny_bits
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| ABSENT.to_owned()),
-                )
-                .execute(pool)
-                .await
-                .context("Failed to save a channel overwrite before reconciliation")?;
-
-                saved_channels
-                    .entry(record.id)
-                    .or_default()
-                    .insert(channel_id_string.clone());
-            }
-
-            let (member_allow, member_deny) = if channel.id == jail_channel_id {
-                (
-                    Permissions::VIEW_CHANNEL
-                        | Permissions::SEND_MESSAGES
-                        | Permissions::READ_MESSAGE_HISTORY,
-                    Permissions::ATTACH_FILES
-                        | Permissions::EMBED_LINKS
-                        | Permissions::CREATE_PUBLIC_THREADS
-                        | Permissions::CREATE_PRIVATE_THREADS
-                        | Permissions::SEND_MESSAGES_IN_THREADS
-                        | Permissions::SEND_VOICE_MESSAGES
-                        | Permissions::SEND_POLLS,
-                )
-            } else {
-                (Permissions::empty(), Permissions::VIEW_CHANNEL)
-            };
-
-            let member_matches = current_member_overwrite.is_some_and(|overwrite| {
-                overwrite.allow == member_allow && overwrite.deny == member_deny
-            });
-
-            if !member_matches {
-                let overwrite = PermissionOverwrite {
-                    allow: Some(member_allow),
-                    deny: Some(member_deny),
-                    id: target_id.cast(),
-                    kind: PermissionOverwriteType::Member,
-                };
-
-                match ratelimit::guard(
-                    Lane::Overwrite,
-                    http.update_channel_permission(channel.id, &overwrite),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        updated += 1;
-                        writes += 1;
-                    }
-                    Err(error) => tracing::warn!(
-                        ?error,
-                        channel_id = %channel.id,
-                        user_id = %target_id,
-                        "Could not repair jailed member permissions in a channel"
-                    ),
-                }
-            }
-        }
     }
 
     if updated > 0 || members_repaired > 0 {
