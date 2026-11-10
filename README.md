@@ -224,7 +224,7 @@ If the source is already on the server (pulled or copied), rebuild there. Rust h
 bash scripts/update.sh
 ```
 
-It backs up `data/jail.sqlite3`, runs `cargo build --release`, checks the binary was actually rewritten, restarts the PM2 process and prints the latest log lines.
+It backs up `data/jail.sqlite3`, runs `cargo build --release`, checks the binary was actually rewritten, restarts the PM2 process and prints the latest log lines. The process is detected automatically (by its command line, then by the names `baby`, `jailbot`, `prisoner-bot`); override it with `PM2_APP=<name> bash scripts/update.sh`.
 
 If the server can reach GitHub, skip the upload entirely:
 

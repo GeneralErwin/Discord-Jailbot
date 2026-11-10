@@ -3,6 +3,7 @@
 # Run this ON THE SERVER, in the bot directory, after pulling or copying source.
 #
 #   bash scripts/update.sh
+#   PM2_APP=baby bash scripts/update.sh     # force a specific process
 #
 # Rust is compiled: copying .rs files does not change the running bot, and
 # `pm2 restart` alone only re-launches the existing binary. This rebuilds the
@@ -20,15 +21,20 @@ if [ -f data/jail.sqlite3 ]; then
   echo "Database backed up to data/jail.sqlite3.bak"
 fi
 
-# Find the PM2 process already running this binary, so the process name never
-# has to be guessed. Prints:
-#   <name>              exactly one process runs the bot
+# Find the PM2 process to restart. Prints:
+#   <name>              found it
 #   __AMBIGUOUS__:<...> several processes run the bot (duplicate instances)
 #   __FALLBACK__:<name> no match, but PM2 holds exactly one app
-#   (nothing)           no safe choice
+#   (nothing)           no safe choice, start a new one
 find_app() {
-  local json matches names count
+  local json matches names count want
+  # 1. Explicit override always wins.
+  if [ -n "${PM2_APP:-}" ] && pm2 describe "$PM2_APP" >/dev/null 2>&1; then
+    printf '%s' "$PM2_APP"
+    return
+  fi
   json=$(pm2 jlist 2>/dev/null || true)
+  # 2. The process whose command line points at the bot binary.
   matches=$(printf '%s' "$json" \
     | sed 's/},{/}\n{/g' \
     | grep -iF 'discord-bot' \
@@ -43,10 +49,18 @@ find_app() {
     printf '__AMBIGUOUS__:%s' "$matches"
     return
   fi
+  # 3. Conventional names, for processes started through npm or a wrapper.
   names=$(printf '%s' "$json" \
     | sed 's/},{/}\n{/g' \
     | grep -o '"name":"[^"]*"' \
     | cut -d'"' -f4 | sort -u || true)
+  for want in baby jailbot prisoner-bot discord-bot; do
+    if printf '%s\n' "$names" | grep -qxF "$want"; then
+      printf '%s' "$want"
+      return
+    fi
+  done
+  # 4. Only when PM2 holds a single app, so nothing else gets bounced silently.
   count=$(printf '%s\n' "$names" | grep -c . || true)
   if [ "$count" -eq 1 ]; then
     printf '__FALLBACK__:%s' "$names"
@@ -89,7 +103,7 @@ if [ -n "$app" ] && pm2 describe "$app" >/dev/null 2>&1; then
   pm2 restart "$app" --update-env
   pm2 logs "$app" --lines 15 --nostream || true
 else
-  echo "No bot process found in PM2 - starting a new one named jailbot"
-  pm2 start "$bin" --name jailbot --cwd "$(pwd)"
-  pm2 logs jailbot --lines 15 --nostream || true
+  echo "No bot process found in PM2 - starting a new one named baby"
+  pm2 start "$bin" --name baby --cwd "$(pwd)"
+  pm2 logs baby --lines 15 --nostream || true
 fi
