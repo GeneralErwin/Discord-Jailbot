@@ -7,7 +7,7 @@
 #
 # Rust is compiled: copying .rs files does not change the running bot, and
 # `pm2 restart` alone only re-launches the existing binary. This rebuilds the
-# release binary, then restarts PM2 so the new build is what actually runs.
+# release binary, restarts PM2, and fails if the new build did not come up.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -67,6 +67,48 @@ find_app() {
   fi
 }
 
+# Confirm the process reached "online" and that its fresh log has no fatal
+# error. Returns non-zero so a crashed build is never reported as a success.
+verify_boot() {
+  local app=$1 i status logs fatal
+  status=""
+  for i in 1 2 3 4 5 6; do
+    status=$(pm2 jlist 2>/dev/null \
+      | sed 's/},{/}\n{/g' \
+      | grep -F "\"name\":\"$app\"" \
+      | grep -o '"status":"[^"]*"' \
+      | head -1 | cut -d'"' -f4 || true)
+    if [ "$status" = "online" ]; then
+      break
+    fi
+    sleep 2
+  done
+
+  logs=$(pm2 logs "$app" --lines 80 --nostream 2>&1 || true)
+  fatal=$(printf '%s\n' "$logs" \
+    | grep -iE "panicked at|thread 'main' panicked|DISCORD_TOKEN|invalid token|already in use|Cannot allocate memory|(^|\| )Error:" \
+    | head -5 || true)
+
+  if [ -n "$fatal" ]; then
+    echo "" >&2
+    echo "UPDATE FAILED - $app crashed on start-up:" >&2
+    printf '%s\n' "$fatal" >&2
+    echo "The previous build is no longer running; fix the error and run this again." >&2
+    return 1
+  fi
+
+  if [ "$status" != "online" ]; then
+    echo "" >&2
+    echo "UPDATE FAILED - $app is '${status:-unknown}' instead of online." >&2
+    printf '%s\n' "$logs" | tail -15 >&2
+    return 1
+  fi
+
+  echo "Bot is online."
+  printf '%s\n' "$logs" | tail -10
+  return 0
+}
+
 echo "Building release binary..."
 cargo build --release
 
@@ -100,10 +142,12 @@ esac
 
 if [ -n "$app" ] && pm2 describe "$app" >/dev/null 2>&1; then
   echo "Restarting PM2 process: $app"
+  # Clear the old log so a panic from an earlier run cannot be blamed on this one.
+  pm2 flush "$app" >/dev/null 2>&1 || true
   pm2 restart "$app" --update-env
-  pm2 logs "$app" --lines 15 --nostream || true
+  verify_boot "$app" || exit 1
 else
   echo "No bot process found in PM2 - starting a new one named baby"
   pm2 start "$bin" --name baby --cwd "$(pwd)"
-  pm2 logs baby --lines 15 --nostream || true
+  verify_boot baby || exit 1
 fi
