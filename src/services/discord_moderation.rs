@@ -18,7 +18,6 @@ use crate::database::repository::{NewJail, SavedRoleInput};
 use crate::services::JailService;
 use crate::services::ratelimit::{self, Lane};
 
-
 /// Upper bound for a single reconciliation pass. Remaining repairs are picked up
 /// by the next sweep, so one large server cannot monopolise the event loop.
 const MAX_WRITES_PER_PASS: usize = 120;
@@ -263,7 +262,11 @@ pub async fn jail_member(
     }
 
     // Create the database record BEFORE changing Discord.
-    let log_reason = reason.as_deref().unwrap_or("No reason provided").to_owned();
+    let log_reason = reason
+        .as_deref()
+        .unwrap_or("No reason provided")
+        .replace('\r', " ")
+        .replace('\n', " ");
 
     let jail = NewJail {
         guild_id: guild_id.to_string(),
@@ -554,7 +557,12 @@ pub async fn send_moderation_log(
             .context("Invalid configured log channel ID")?,
     );
 
-    ratelimit::guard(Lane::Message, http.create_message(channel_id).content(message)).await?;
+    let embed = crate::embeds::moderation_log(message);
+    ratelimit::guard(
+        Lane::Message,
+        http.create_message(channel_id).embeds(&[embed]),
+    )
+    .await?;
 
     Ok(())
 }
@@ -721,7 +729,8 @@ pub async fn reconcile_guild(
                 .context("Invalid jailed user ID")?,
         );
 
-        let target = match ratelimit::guard(Lane::Read, http.guild_member(guild_id, target_id)).await
+        let target = match ratelimit::guard(Lane::Read, http.guild_member(guild_id, target_id))
+            .await
         {
             Ok(response) => match response.model().await {
                 Ok(member) => Some(member),
@@ -908,7 +917,6 @@ pub async fn reconcile_guild(
                 ),
             }
         }
-
     }
 
     if updated > 0 || members_repaired > 0 {

@@ -1,6 +1,7 @@
 mod commands;
 mod database;
 mod discord;
+mod embeds;
 mod services;
 
 use anyhow::Context;
@@ -13,6 +14,12 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
+        .compact()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(true)
+        .with_line_number(true)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )

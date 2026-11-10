@@ -1,7 +1,7 @@
 use twilight_interactions::command::{CommandModel, CreateCommand};
 use twilight_model::id::{
     Id,
-    marker::{ChannelMarker, UserMarker},
+    marker::{ChannelMarker, RoleMarker, UserMarker},
 };
 
 #[derive(CommandModel, CreateCommand)]
@@ -46,3 +46,57 @@ pub struct JailInfoCommand {
 #[derive(CommandModel, CreateCommand)]
 #[command(name = "jailconfig", desc = "View this server's jail configuration")]
 pub struct JailConfigCommand;
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "help", desc = "Show the bot's commands and permissions")]
+pub struct HelpCommand;
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "changelog", desc = "Show recent bot changes")]
+pub struct ChangelogCommand;
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "quarantine", desc = "Enable or disable the quarantine service")]
+pub struct QuarantineCommand;
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "enable", desc = "Enable a quarantine module")]
+pub struct EnableModuleCommand {
+    /// Module key shown by `/quarantine`.
+    pub module: String,
+}
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "disable", desc = "Disable a quarantine module")]
+pub struct DisableModuleCommand {
+    /// Module key shown by `/quarantine`.
+    pub module: String,
+}
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "sanitize", desc = "Repair jail permissions in every channel")]
+pub struct SanitizeCommand;
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "set", desc = "Configure bot moderation roles")]
+pub enum SetCommand {
+    #[command(name = "moderator")]
+    Moderator(SetModeratorCommands),
+}
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "moderator", desc = "Configure the moderator role")]
+pub enum SetModeratorCommands {
+    #[command(name = "role")]
+    Role(SetModeratorRoleCommand),
+}
+
+#[derive(CommandModel, CreateCommand)]
+#[command(
+    name = "role",
+    desc = "Set the role allowed to jail lower-ranked members"
+)]
+pub struct SetModeratorRoleCommand {
+    /// The server's moderator role.
+    pub role: Id<RoleMarker>,
+}

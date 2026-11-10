@@ -4,18 +4,20 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::commands::moderation::{
-    JailCommand, JailConfigCommand, JailInfoCommand, PrisonersCommand, SetLogsCommand,
-    UnjailCommand,
+    ChangelogCommand, DisableModuleCommand, EnableModuleCommand, HelpCommand, JailCommand,
+    JailConfigCommand, JailInfoCommand, PrisonersCommand, QuarantineCommand, SanitizeCommand,
+    SetCommand, SetLogsCommand, SetModeratorCommands, UnjailCommand,
 };
 use crate::services::ratelimit::{self, Lane};
 
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
 use twilight_http::Client as HttpClient;
-use twilight_interactions::command::{CommandInputData, CreateCommand};
+use twilight_interactions::command::{CommandInputData, CommandModel, CreateCommand};
 
 use twilight_model::{
     application::interaction::{Interaction, InteractionData},
     channel::ChannelType,
+    channel::permission_overwrite::PermissionOverwriteType as ChannelOverwriteType,
     guild::Permissions,
     http::{
         interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
@@ -35,7 +37,7 @@ struct PingCommand;
 #[command(
     name = "jailsetup",
     desc = "Create or find the Prisoner role",
-    default_permissions = "moderator_permissions"
+    default_permissions = "admin_permissions"
 )]
 struct JailSetupCommand;
 
@@ -43,7 +45,7 @@ struct JailSetupCommand;
 #[command(
     name = "setjail",
     desc = "Set the channel prisoners can access",
-    default_permissions = "manage_channels_permissions"
+    default_permissions = "admin_permissions"
 )]
 struct SetJailCommand {
     /// The text channel prisoners will be allowed to use.
@@ -51,12 +53,8 @@ struct SetJailCommand {
     channel: Id<ChannelMarker>,
 }
 
-fn moderator_permissions() -> Permissions {
-    Permissions::MANAGE_ROLES
-}
-
-fn manage_channels_permissions() -> Permissions {
-    Permissions::MANAGE_CHANNELS
+fn admin_permissions() -> Permissions {
+    Permissions::ADMINISTRATOR
 }
 
 /// How often queued repair work is flushed.
@@ -87,6 +85,13 @@ pub async fn run(
         PrisonersCommand::create_command().into(),
         JailInfoCommand::create_command().into(),
         JailConfigCommand::create_command().into(),
+        HelpCommand::create_command().into(),
+        ChangelogCommand::create_command().into(),
+        QuarantineCommand::create_command().into(),
+        EnableModuleCommand::create_command().into(),
+        DisableModuleCommand::create_command().into(),
+        SanitizeCommand::create_command().into(),
+        SetCommand::create_command().into(),
     ];
 
     http.interaction(application_id)
@@ -101,7 +106,11 @@ pub async fn run(
     let mut shard = Shard::new(
         ShardId::ONE,
         token,
-        Intents::GUILDS | Intents::GUILD_MEMBERS,
+        Intents::GUILDS
+            | Intents::GUILD_MEMBERS
+            | Intents::GUILD_MODERATION
+            | Intents::GUILD_WEBHOOKS
+            | Intents::GUILD_MESSAGES,
     );
 
     let mut maintenance_tick = tokio::time::interval(Duration::from_secs(30));
@@ -113,6 +122,7 @@ pub async fn run(
     let mut repair_tick = tokio::time::interval(REPAIR_TICK);
     let mut pending_repairs: HashSet<u64> = HashSet::new();
     let mut last_repair: HashMap<u64, Instant> = HashMap::new();
+    let mut quarantine_runtime = crate::services::quarantine::Runtime::default();
 
     tracing::info!("Connecting to Discord...");
 
@@ -173,6 +183,24 @@ pub async fn run(
                             handle_interaction(&http, application_id, event.0, &pool).await
                         {
                             tracing::error!(?error, "Failed to handle interaction");
+                        }
+                    }
+
+                    Ok(Event::GuildAuditLogEntryCreate(event)) => {
+                        if let Some(guild_id) = event.0.guild_id {
+                            if let Err(error) = crate::services::quarantine::handle_audit_entry(
+                                &http, &pool, guild_id, &event.0, &mut quarantine_runtime
+                            ).await {
+                                tracing::error!(?error, guild_id = %guild_id, "Quarantine audit response failed");
+                            }
+                        }
+                    }
+
+                    Ok(Event::MessageCreate(event)) => {
+                        if let Err(error) = crate::services::quarantine::handle_webhook_message(
+                            &http, &pool, &event, &mut quarantine_runtime
+                        ).await {
+                            tracing::error!(?error, "Webhook raid containment failed");
                         }
                     }
 
@@ -545,6 +573,16 @@ async fn handle_interaction(
             .await?;
         }
 
+        "help" => {
+            let message = "**Bot commands**\n`/help` — Show this command list.\n`/changelog` — Show recent changes.\n`/jail member [duration] [reason]` — Jail a member below your moderator role.\n`/unjail member` — Release a member below your moderator role.\n`/prisoners` — List active jail records.\n`/jailinfo member` — View a member's jail history.\n`/jailconfig` — View jail configuration.\n`/jailsetup` — Create or find the Prisoner role.\n`/setjail channel` — Configure the jail channel.\n`/setlogs channel` — Configure the moderation log channel.\n`/set moderator role` — Choose who may jail lower ranked members.\n`/sanitize` — Repair Prisoner role permissions across channels.\n`/quarantine` — Enable or disable the quarantine service.\n`/enable module` and `/disable module` — Toggle individual quarantine protections.\n`/ping` — Check bot status.\n\nConfiguration commands require the server owner or an administrator. Jail actions require the configured moderator role and a lower ranked target.";
+            respond(http, application_id, &interaction, message).await?;
+        }
+
+        "changelog" => {
+            let message = "**Recent changes**\n• Added `/help` and `/changelog`.\n• Added a configurable quarantine service with per-module controls.\n• Added reversals for dangerous role grants and permission escalations.\n• Added webhook raid containment, moderator-role jail access, and `/sanitize`.";
+            respond(http, application_id, &interaction, message).await?;
+        }
+
         "jailsetup" => {
             let Some(guild_id) = interaction.guild_id else {
                 respond(
@@ -557,6 +595,25 @@ async fn handle_interaction(
 
                 return Ok(());
             };
+
+            if let Err(error) = ensure_admin_or_owner(
+                http,
+                guild_id,
+                interaction
+                    .author_id()
+                    .context("Could not identify the user")?,
+            )
+            .await
+            {
+                respond(
+                    http,
+                    application_id,
+                    &interaction,
+                    &format!("You cannot configure the jail system: {error:#}"),
+                )
+                .await?;
+                return Ok(());
+            }
 
             match setup_prisoner_role(http, pool, guild_id).await {
                 Ok(role_id) => {
@@ -595,6 +652,25 @@ async fn handle_interaction(
 
                 return Ok(());
             };
+
+            if let Err(error) = ensure_admin_or_owner(
+                http,
+                guild_id,
+                interaction
+                    .author_id()
+                    .context("Could not identify the user")?,
+            )
+            .await
+            {
+                respond(
+                    http,
+                    application_id,
+                    &interaction,
+                    &format!("You cannot configure the jail system: {error:#}"),
+                )
+                .await?;
+                return Ok(());
+            }
 
             let command_input = CommandInputData::from((**command).clone());
 
@@ -650,7 +726,7 @@ async fn handle_interaction(
             defer_interaction(http, application_id, &interaction).await?;
 
             let result: anyhow::Result<String> = async {
-                ensure_moderator(http, guild_id, moderator_id, target_id).await?;
+                ensure_moderator(http, pool, guild_id, moderator_id, target_id).await?;
 
                 let config = crate::database::config_repository::get_guild_config(
                     pool,
@@ -727,7 +803,7 @@ async fn handle_interaction(
             defer_interaction(http, application_id, &interaction).await?;
 
             let result: anyhow::Result<String> = async {
-                ensure_moderator(http, guild_id, moderator_id, target_id).await?;
+                ensure_moderator(http, pool, guild_id, moderator_id, target_id).await?;
 
                 let config = crate::database::config_repository::get_guild_config(
                     pool,
@@ -768,6 +844,176 @@ async fn handle_interaction(
             edit_deferred_response(http, application_id, &interaction, &message).await?;
         }
 
+        "set" => {
+            let guild_id = interaction
+                .guild_id
+                .context("This command can only be used in a server")?;
+            let actor_id = interaction
+                .author_id()
+                .context("Could not identify the user")?;
+            let input = CommandInputData::from((**command).clone());
+            let parsed = SetCommand::from_interaction(input)?;
+            let SetCommand::Moderator(SetModeratorCommands::Role(set_role)) = parsed;
+
+            let result: anyhow::Result<String> = async {
+                ensure_admin_or_owner(http, guild_id, actor_id).await?;
+                let roles = ratelimit::guard(Lane::Read, http.roles(guild_id)).await?.models().await?;
+                let role = roles.iter().find(|role| role.id == set_role.role)
+                    .context("That role does not belong to this server")?;
+                let everyone_id: Id<RoleMarker> = guild_id.cast();
+                if role.id == everyone_id {
+                    bail!("The @everyone role cannot be used as the moderator role");
+                }
+                crate::database::config_repository::set_moderator_role(
+                    pool, &guild_id.to_string(), Some(&role.id.to_string())
+                ).await?;
+                Ok(format!("Moderator role set to <@&{}>. Members with this role can jail members whose highest role is below theirs.", role.id))
+            }.await;
+
+            let message = match result {
+                Ok(message) => message,
+                Err(error) => format!("Could not set the moderator role: {error:#}"),
+            };
+            respond(http, application_id, &interaction, &message).await?;
+        }
+
+        "quarantine" => {
+            let guild_id = interaction
+                .guild_id
+                .context("This command can only be used in a server")?;
+            let actor_id = interaction
+                .author_id()
+                .context("Could not identify the user")?;
+            let result: anyhow::Result<String> = async {
+                ensure_admin_or_owner(http, guild_id, actor_id).await?;
+                let guild_string = guild_id.to_string();
+                let config =
+                    crate::database::config_repository::ensure_guild_config(pool, &guild_string)
+                        .await?;
+                let enabling = !config.quarantine_enabled;
+                if enabling {
+                    crate::database::config_repository::initialize_quarantine_modules(
+                        pool,
+                        &guild_string,
+                        &crate::services::quarantine::module_keys(),
+                    )
+                    .await?;
+                }
+                crate::database::config_repository::set_quarantine_enabled(
+                    pool,
+                    &guild_string,
+                    enabling,
+                )
+                .await?;
+                crate::services::quarantine::status_message(pool, guild_id).await
+            }
+            .await;
+            let message = match result {
+                Ok(message) => message,
+                Err(error) => format!("Could not update quarantine: {error:#}"),
+            };
+            respond(http, application_id, &interaction, &message).await?;
+        }
+
+        "enable" | "disable" => {
+            let guild_id = interaction
+                .guild_id
+                .context("This command can only be used in a server")?;
+            let actor_id = interaction
+                .author_id()
+                .context("Could not identify the user")?;
+            let enabled = command.name == "enable";
+            let input = CommandInputData::from((**command).clone());
+            let raw_module = if enabled {
+                EnableModuleCommand::from_interaction(input)?.module
+            } else {
+                DisableModuleCommand::from_interaction(input)?.module
+            };
+            let result: anyhow::Result<String> = async {
+                ensure_admin_or_owner(http, guild_id, actor_id).await?;
+                let key =
+                    crate::services::quarantine::find_module_key(&raw_module).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Unknown module. Run `/quarantine` to see valid module names."
+                        )
+                    })?;
+                crate::database::config_repository::set_quarantine_module(
+                    pool,
+                    &guild_id.to_string(),
+                    key,
+                    enabled,
+                )
+                .await?;
+                let label = crate::services::quarantine::MODULES
+                    .iter()
+                    .find(|module| module.key == key)
+                    .map(|module| module.label)
+                    .unwrap_or(key);
+                let state = crate::database::config_repository::get_guild_config(
+                    pool,
+                    &guild_id.to_string(),
+                )
+                .await?
+                .is_some_and(|config| config.quarantine_enabled);
+                Ok(format!(
+                    "{} **{label}**. Quarantine service is {}.",
+                    if enabled { "Enabled" } else { "Disabled" },
+                    if state { "active" } else { "inactive" }
+                ))
+            }
+            .await;
+            let message = match result {
+                Ok(message) => message,
+                Err(error) => format!("Could not change quarantine module: {error:#}"),
+            };
+            respond(http, application_id, &interaction, &message).await?;
+        }
+
+        "sanitize" => {
+            let guild_id = interaction
+                .guild_id
+                .context("This command can only be used in a server")?;
+            let actor_id = interaction
+                .author_id()
+                .context("Could not identify the user")?;
+            defer_interaction(http, application_id, &interaction).await?;
+            let result: anyhow::Result<String> = async {
+                ensure_admin_or_owner(http, guild_id, actor_id).await?;
+                let config = crate::database::config_repository::get_guild_config(
+                    pool,
+                    &guild_id.to_string(),
+                )
+                .await?
+                .context("Run `/jailsetup` and `/setjail` first")?;
+                let prisoner_role_id = Id::<RoleMarker>::new(
+                    config
+                        .prisoner_role_id
+                        .as_deref()
+                        .context("Prisoner role is not configured")?
+                        .parse::<u64>()?,
+                );
+                let jail_channel_id = Id::<ChannelMarker>::new(
+                    config
+                        .jail_channel_id
+                        .as_deref()
+                        .context("Jail channel is not configured")?
+                        .parse::<u64>()?,
+                );
+                let updated =
+                    sanitize_jail_permissions(http, guild_id, prisoner_role_id, jail_channel_id)
+                        .await?;
+                Ok(format!(
+                    "Sanitize complete. Corrected Prisoner role permissions in {updated} channels."
+                ))
+            }
+            .await;
+            let message = match result {
+                Ok(message) => message,
+                Err(error) => format!("Could not sanitize channel permissions: {error:#}"),
+            };
+            edit_deferred_response(http, application_id, &interaction, &message).await?;
+        }
+
         "setlogs" => {
             let guild_id = interaction
                 .guild_id
@@ -786,14 +1032,7 @@ async fn handle_interaction(
             defer_interaction(http, application_id, &interaction).await?;
 
             let result: anyhow::Result<String> = async {
-                ensure_permission(
-                    http,
-                    guild_id,
-                    moderator_id,
-                    Permissions::MANAGE_CHANNELS,
-                    "You need Manage Channels permission to configure the log channel.",
-                )
-                .await?;
+                ensure_admin_or_owner(http, guild_id, moderator_id).await?;
 
                 let guild_id_string = guild_id.to_string();
                 let channel_id_string = channel_id.to_string();
@@ -969,14 +1208,7 @@ async fn handle_interaction(
             defer_interaction(http, application_id, &interaction).await?;
 
             let result: anyhow::Result<String> = async {
-                ensure_permission(
-                    http,
-                    guild_id,
-                    moderator_id,
-                    Permissions::MANAGE_ROLES,
-                    "You need Manage Roles permission to view the jail configuration.",
-                )
-                .await?;
+                ensure_admin_or_owner(http, guild_id, moderator_id).await?;
 
                 let config = crate::database::config_repository::get_guild_config(
                     pool,
@@ -1008,9 +1240,15 @@ async fn handle_interaction(
                     .as_deref()
                     .map(|id| format!("<#{id}>"))
                     .unwrap_or_else(|| "Not configured".to_owned());
+                let moderator_role = config
+                    .moderator_role_id
+                    .as_deref()
+                    .map(|id| format!("<@&{id}>"))
+                    .unwrap_or_else(|| "Not configured".to_owned());
 
                 Ok(format!(
-                    "**Jail Configuration**\nPrisoner role: {prisoner_role}\nJail channel: {jail_channel}\nLogs channel: {logs_channel}\nSetup complete: {}\nAutomatic release: {}",
+                    "**Jail Configuration**\nPrisoner role: {prisoner_role}\nJail channel: {jail_channel}\nLogs channel: {logs_channel}\nModerator role: {moderator_role}\nQuarantine service: {}\nSetup complete: {}\nAutomatic release: {}",
+                    if config.quarantine_enabled { "Enabled" } else { "Disabled" },
                     if config.setup_complete { "Enabled" } else { "Incomplete" },
                     if config.auto_release_enabled { "Enabled" } else { "Disabled" },
                 ))
@@ -1089,7 +1327,10 @@ async fn configure_jail_channel(
 
     let prisoner_role_id = Id::<RoleMarker>::new(prisoner_role_id);
 
-    let channels = http.guild_channels(guild_id).await?.models().await?;
+    let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
+        .await?
+        .models()
+        .await?;
 
     let selected_channel = channels
         .iter()
@@ -1103,10 +1344,8 @@ async fn configure_jail_channel(
     let mut updated_count = 0;
 
     for channel in &channels {
-        let (allow, deny) = crate::services::discord_moderation::prisoner_overwrite(
-            channel.id,
-            jail_channel_id,
-        );
+        let (allow, deny) =
+            crate::services::discord_moderation::prisoner_overwrite(channel.id, jail_channel_id);
 
         let overwrite = PermissionOverwrite {
             allow: Some(allow),
@@ -1141,6 +1380,52 @@ async fn configure_jail_channel(
     Ok(updated_count)
 }
 
+async fn sanitize_jail_permissions(
+    http: &HttpClient,
+    guild_id: Id<GuildMarker>,
+    prisoner_role_id: Id<RoleMarker>,
+    jail_channel_id: Id<ChannelMarker>,
+) -> anyhow::Result<usize> {
+    let channels = ratelimit::guard(Lane::Read, http.guild_channels(guild_id))
+        .await?
+        .models()
+        .await?;
+    let mut corrected = 0;
+    for channel in &channels {
+        let (allow, deny) =
+            crate::services::discord_moderation::prisoner_overwrite(channel.id, jail_channel_id);
+        let current = channel
+            .permission_overwrites
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|overwrite| {
+                overwrite.kind == ChannelOverwriteType::Role
+                    && overwrite.id == prisoner_role_id.cast()
+            });
+        let already_correct =
+            current.is_some_and(|overwrite| overwrite.allow == allow && overwrite.deny == deny);
+        if already_correct {
+            continue;
+        }
+
+        let overwrite = PermissionOverwrite {
+            allow: Some(allow),
+            deny: Some(deny),
+            id: prisoner_role_id.cast(),
+            kind: PermissionOverwriteType::Role,
+        };
+        ratelimit::guard(
+            Lane::Overwrite,
+            http.update_channel_permission(channel.id, &overwrite),
+        )
+        .await
+        .with_context(|| format!("Could not repair permissions for channel {}", channel.id))?;
+        corrected += 1;
+    }
+    Ok(corrected)
+}
+
 async fn respond(
     http: &HttpClient,
     application_id: Id<ApplicationMarker>,
@@ -1150,15 +1435,18 @@ async fn respond(
     let response = InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
-            content: Some(content.to_owned()),
+            embeds: Some(vec![crate::embeds::response(content)]),
             ..Default::default()
         }),
     };
 
     ratelimit::guard(
         Lane::Interaction,
-        http.interaction(application_id)
-            .create_response(interaction.id, &interaction.token, &response),
+        http.interaction(application_id).create_response(
+            interaction.id,
+            &interaction.token,
+            &response,
+        ),
     )
     .await?;
 
@@ -1176,8 +1464,11 @@ async fn defer_interaction(
 
     ratelimit::guard(
         Lane::Interaction,
-        http.interaction(application_id)
-            .create_response(interaction.id, &interaction.token, &response),
+        http.interaction(application_id).create_response(
+            interaction.id,
+            &interaction.token,
+            &response,
+        ),
     )
     .await?;
 
@@ -1190,11 +1481,13 @@ async fn edit_deferred_response(
     interaction: &Interaction,
     content: &str,
 ) -> anyhow::Result<()> {
+    let embed = crate::embeds::response(content);
     ratelimit::guard(
         Lane::Message,
         http.interaction(application_id)
             .update_response(&interaction.token)
-            .content(Some(content)),
+            .embeds(Some(std::slice::from_ref(&embed)))
+            .content(None),
     )
     .await?;
 
@@ -1203,6 +1496,7 @@ async fn edit_deferred_response(
 
 async fn ensure_moderator(
     http: &HttpClient,
+    pool: &SqlitePool,
     guild_id: Id<GuildMarker>,
     moderator_id: Id<UserMarker>,
     target_id: Id<UserMarker>,
@@ -1218,6 +1512,19 @@ async fn ensure_moderator(
         return Ok(());
     }
 
+    if target_id == guild.owner_id {
+        bail!("The server owner cannot be moderated.");
+    }
+
+    let config = crate::database::config_repository::get_guild_config(pool, &guild_id.to_string())
+        .await?
+        .context("Run `/set moderator role` to configure who may jail members")?;
+    let moderator_role_id = config.moderator_role_id.as_deref()
+        .context("The moderator role is not configured. Ask an administrator to run `/set moderator role`.")?
+        .parse::<u64>()
+        .context("The configured moderator role ID is invalid")?;
+    let moderator_role_id = Id::<RoleMarker>::new(moderator_role_id);
+
     let moderator = http
         .guild_member(guild_id, moderator_id)
         .await?
@@ -1232,27 +1539,18 @@ async fn ensure_moderator(
 
     let roles = http.roles(guild_id).await?.models().await?;
 
-    let everyone_id: Id<RoleMarker> = guild_id.cast();
-
-    let mut moderator_permissions = Permissions::empty();
-
-    if let Some(everyone) = roles.iter().find(|role| role.id == everyone_id) {
-        moderator_permissions |= everyone.permissions;
-    }
-
     let mut moderator_highest = 0_i64;
+    let mut has_moderator_role = false;
 
     for role_id in &moderator.roles {
         if let Some(role) = roles.iter().find(|role| role.id == *role_id) {
-            moderator_permissions |= role.permissions;
             moderator_highest = moderator_highest.max(role.position);
+            has_moderator_role |= role.id == moderator_role_id;
         }
     }
 
-    if !moderator_permissions.contains(Permissions::ADMINISTRATOR)
-        && !moderator_permissions.contains(Permissions::MANAGE_ROLES)
-    {
-        bail!("You need Manage Roles permission to use this command.");
+    if !has_moderator_role {
+        bail!("You need the configured Moderator role to jail or release members.");
     }
 
     let mut target_highest = 0_i64;
@@ -1268,6 +1566,21 @@ async fn ensure_moderator(
     }
 
     Ok(())
+}
+
+async fn ensure_admin_or_owner(
+    http: &HttpClient,
+    guild_id: Id<GuildMarker>,
+    member_id: Id<UserMarker>,
+) -> anyhow::Result<()> {
+    ensure_permission(
+        http,
+        guild_id,
+        member_id,
+        Permissions::ADMINISTRATOR,
+        "Only the server owner or an administrator can change bot configuration.",
+    )
+    .await
 }
 
 async fn ensure_permission(

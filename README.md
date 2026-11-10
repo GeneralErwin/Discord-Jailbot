@@ -4,7 +4,7 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 
 > **Status: Beta**
 >
-> Everything listed under "Implemented" below exists in the code and is enabled by default. Large servers should still be watched during the first jail/release cycle, because the bot repairs state in bounded, rate-limited passes rather than all at once.
+> Everything listed below exists in the code. Features with an explicit setup switch, including quarantine, stay off until configured. Large servers should still be watched during the first jail/release cycle, because the bot repairs state in bounded, rate-limited passes rather than all at once.
 
 ## Features
 
@@ -13,14 +13,21 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 | Command | Permission | Purpose |
 |---|---|---|
 | `/ping` | — | Check whether the bot is responding. |
-| `/jailsetup` | Manage Roles | Create or find the `Prisoner` role. |
-| `/setjail` | Manage Channels | Choose the channel prisoners may use, and apply overwrites to every channel. |
-| `/jail` | Manage Roles | Jail a member, with an optional duration (`30m`, `2h`, `3d`, `1w`) and reason. |
-| `/unjail` | Manage Roles | Release a member and restore their previous state. |
-| `/setlogs` | Manage Channels | Set the moderation log channel. |
+| `/jailsetup` | Administrator or owner | Create or find the `Prisoner` role. |
+| `/setjail` | Administrator or owner | Choose the channel prisoners may use, and apply overwrites to every channel. |
+| `/jail` | Configured Moderator role, or owner | Jail a lower-ranked member, with an optional duration (`30m`, `2h`, `3d`, `1w`) and reason. |
+| `/unjail` | Configured Moderator role, or owner | Release a lower-ranked member and restore their previous state. |
+| `/set moderator role` | Administrator or owner | Choose who may jail members below their highest role. |
+| `/setlogs` | Administrator or owner | Set the moderation log channel. |
 | `/prisoners` | Manage Roles | List the server's current prisoners. |
 | `/jailinfo` | Manage Roles | Show a member's jail history. |
-| `/jailconfig` | Manage Roles | Show the server's jail configuration. |
+| `/jailconfig` | Administrator or owner | Show the server's jail configuration. |
+| `/sanitize` | Administrator or owner | Scan channels and repair incorrect `Prisoner` role permissions. |
+| `/quarantine` | Administrator or owner | Toggle quarantine and display module states. All modules start enabled. |
+| `/enable module` and `/disable module` | Administrator or owner | Toggle one quarantine module. |
+| `/help` | Everyone | Show the command list. |
+| `/changelog` | Everyone | Show recent changes. |
+| `/ping` | Everyone | Check whether the bot is responding. |
 
 ### Jail state
 
@@ -37,6 +44,17 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 - **Recovery** — a startup sweep plus a five-minute sweep repair any state left behind by an API failure or a restart.
 - **Deleted channels** — their saved overwrite snapshots are discarded instead of accumulating.
 
+### Quarantine service
+
+Run `/quarantine` as the server owner or an administrator to turn the service on. On first activation all seven modules start enabled; `/quarantine` also displays their states with a green check or red X. Use `/enable module` and `/disable module` with one of the module names in that embed to change individual protections. Run `/quarantine` again to pause the full service.
+
+- Dangerous role grants and removals are reversed when the affected role has moderation permissions, then the audit-log actor is jailed.
+- Dangerous role permission changes are reset to the old permission set. Dangerous channel overwrites are restored from the audit log.
+- Changes to a jailed member's roles queue the existing jail repair and quarantine the actor.
+- A channel deletion quarantines and logs the actor. Discord does not let the bot restore the deleted channel's original ID or messages.
+- Three webhook creations within 30 seconds, or a webhook mass mention, trigger containment: delete all guild webhooks and remove `Manage Webhooks` from roles and channel overwrites.
+- Automatic quarantine jailing requires `/jailsetup` and `/setjail`. If the bot lacks hierarchy or API permissions to reverse an action, the failure is logged and the bot reports the failed step.
+
 ### Safety limits
 
 The bot protects itself and your server instead of relying on Discord to throttle it:
@@ -50,7 +68,7 @@ The bot protects itself and your server instead of relying on Discord to throttl
 ### Moderator protection
 
 - Self-moderation and jailing the server owner are refused.
-- Moderators need Manage Roles, plus a strictly higher highest-role position than their target.
+- `/jail` and `/unjail` require the configured Moderator role and a strictly higher highest-role position than the target. The owner can always moderate.
 - The bot refuses to run if the `Prisoner` role has Administrator, if `@everyone` has Administrator, or if its own highest role is not above the roles it must remove.
 
 ## Technology
@@ -96,9 +114,9 @@ The bot creates its database automatically at `data/jail.sqlite3` and applies mi
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
 2. Create a bot and obtain its token.
-3. Enable the **Server Members Intent** under Privileged Gateway Intents.
+3. Enable the **Server Members Intent** under Privileged Gateway Intents. The bot also requests the Guild Messages intent to detect webhook mass mentions.
 4. Invite the bot with the `bot` and `applications.commands` scopes.
-5. Grant Manage Roles, Manage Channels and Manage Nicknames.
+5. Grant Manage Roles, Manage Channels, Manage Nicknames, View Audit Log, and Manage Webhooks.
 6. Make sure the bot's highest role is above every role it has to remove or restore.
 
 Then, in the server:
@@ -107,8 +125,12 @@ Then, in the server:
 /ping
 /jailsetup
 /setjail
+/set moderator role
 /setlogs   (optional but recommended)
+/quarantine   (optional)
 ```
+
+View Audit Log is required for quarantine to identify who made a change. Quarantine can remove Manage Webhooks from role and channel permissions when it contains a webhook raid.
 
 ## Running
 
@@ -226,7 +248,8 @@ discord-bot/
 
 SQLite persists:
 
-- Guild configuration (Prisoner role, jail channel, log channel, setup state, auto-release)
+- Guild configuration (Prisoner role, jail channel, log channel, moderator role, quarantine state)
+- Per-server quarantine module states
 - Active and historical jail records
 - Saved member roles and original nicknames
 - Original member-specific channel permissions

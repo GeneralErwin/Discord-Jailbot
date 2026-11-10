@@ -6,11 +6,19 @@ pub struct GuildConfig {
     pub prisoner_role_id: Option<String>,
     pub jail_channel_id: Option<String>,
     pub logs_channel_id: Option<String>,
+    pub moderator_role_id: Option<String>,
     pub setup_complete: bool,
     pub auto_release_enabled: bool,
+    pub quarantine_enabled: bool,
     pub permissions_last_reconciled_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct QuarantineModule {
+    pub module_key: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
