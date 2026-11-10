@@ -2,6 +2,7 @@ mod commands;
 mod database;
 mod discord;
 mod embeds;
+mod prisoner_ui;
 mod services;
 
 use anyhow::Context;

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::commands::moderation::{
     ChangelogCommand, DisableModuleCommand, EnableModuleCommand, HelpCommand, JailCommand,
-    JailConfigCommand, JailInfoCommand, PrisonersCommand, QuarantineCommand, SanitizeCommand,
-    SetCommand, SetLogsCommand, SetModeratorCommands, UnjailCommand,
+    JailConfigCommand, JailInfoCommand, PrisonerCommand, PrisonersCommand, QuarantineCommand,
+    SanitizeCommand, SetCommand, SetLogsCommand, SetModeratorCommands, UnjailCommand,
 };
 use crate::services::ratelimit::{self, Lane};
 
@@ -86,6 +86,7 @@ pub async fn run(
         PrisonersCommand::create_command().into(),
         JailInfoCommand::create_command().into(),
         JailConfigCommand::create_command().into(),
+        PrisonerCommand::create_command().into(),
         HelpCommand::create_command().into(),
         ChangelogCommand::create_command().into(),
         QuarantineCommand::create_command().into(),
@@ -579,6 +580,7 @@ async fn handle_interaction(
                 application_id,
                 &interaction,
                 &component.custom_id,
+                &component.values,
                 pool,
             )
             .await;
@@ -1122,67 +1124,45 @@ async fn handle_interaction(
             edit_deferred_response(http, application_id, &interaction, &message).await?;
         }
 
-        "prisoners" => {
+        "prisoner" | "prisoners" => {
             let guild_id = interaction
                 .guild_id
                 .context("This command can only be used in a server")?;
 
-            let moderator_id = interaction
+            let owner_id = interaction
                 .author_id()
                 .context("Could not identify the moderator")?;
 
-            defer_interaction(http, application_id, &interaction).await?;
+            defer_ephemeral_interaction(http, application_id, &interaction).await?;
 
-            let result: anyhow::Result<String> = async {
+            let result = async {
                 ensure_permission(
                     http,
                     guild_id,
-                    moderator_id,
+                    owner_id,
                     Permissions::MANAGE_ROLES,
                     "You need Manage Roles permission to view the prisoner list.",
                 )
                 .await?;
 
-                let service = crate::services::JailService::new(pool.clone());
-                let records = service.list_prisoners(&guild_id.to_string()).await?;
-
-                if records.is_empty() {
-                    return Ok("There are currently no jailed members.".to_owned());
-                }
-
-                let total = records.len();
-                let mut message = format!("**Currently jailed members ({total})**\n");
-
-                for record in records.iter().take(8) {
-                    let reason = record.reason.as_deref().unwrap_or("No reason provided");
-                    let reason = reason.replace('\n', " ");
-                    let reason: String = reason.chars().take(80).collect();
-                    let release = record
-                        .release_at
-                        .as_deref()
-                        .map(|value| format!(" | releases: `{value}`"))
-                        .unwrap_or_else(|| " | indefinite".to_owned());
-
-                    message.push_str(&format!(
-                        "\n• <@{}> — {}{}",
-                        record.user_id, reason, release
-                    ));
-                }
-
-                if total > 8 {
-                    message.push_str(&format!("\n…and {} more.", total - 8));
-                }
-
-                Ok(message)
+                crate::prisoner_ui::page(http, pool, guild_id, owner_id, 1).await
             }
             .await;
 
-            let message = match result {
-                Ok(message) => message,
-                Err(error) => format!("Could not retrieve the prisoner list: {error:#}"),
-            };
-
-            edit_deferred_response(http, application_id, &interaction, &message).await?;
+            match result {
+                Ok(page) => {
+                    edit_deferred_prisoner_page(http, application_id, &interaction, page).await?;
+                }
+                Err(error) => {
+                    edit_deferred_response(
+                        http,
+                        application_id,
+                        &interaction,
+                        &format!("Could not retrieve the prisoner list: {error:#}"),
+                    )
+                    .await?;
+                }
+            }
         }
 
         "jailinfo" => {
@@ -1497,8 +1477,21 @@ async fn handle_component_interaction(
     application_id: Id<ApplicationMarker>,
     interaction: &Interaction,
     custom_id: &str,
+    values: &[String],
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
+    if custom_id.starts_with("prisoner:") {
+        return handle_prisoner_component(
+            http,
+            application_id,
+            interaction,
+            custom_id,
+            values,
+            pool,
+        )
+        .await;
+    }
+
     match custom_id {
         "bot:help" => {
             return respond_component_ephemeral_embed(
@@ -1791,6 +1784,403 @@ async fn handle_component_interaction(
     Ok(())
 }
 
+async fn handle_prisoner_component(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    custom_id: &str,
+    values: &[String],
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let parts = custom_id.split(':').collect::<Vec<_>>();
+    if parts.len() < 4 || parts[0] != "prisoner" {
+        return respond_component_ephemeral(
+            http,
+            application_id,
+            interaction,
+            "This prisoner control is invalid.",
+        )
+        .await;
+    }
+    let action = parts[1];
+    let expected_guild_id = parts[2].parse::<u64>().ok();
+    let owner_id = parts[3].parse::<u64>().ok();
+    let Some(guild_id) = interaction.guild_id else {
+        return respond_component_ephemeral(
+            http,
+            application_id,
+            interaction,
+            "Prisoner controls can only be used inside a server.",
+        )
+        .await;
+    };
+    let actor_id = interaction
+        .author_id()
+        .context("Could not identify the user")?;
+    if expected_guild_id != Some(guild_id.get()) || owner_id != Some(actor_id.get()) {
+        return respond_component_ephemeral(
+            http,
+            application_id,
+            interaction,
+            "This private prisoner panel belongs to another server or user.",
+        )
+        .await;
+    }
+
+    defer_component_update(http, application_id, interaction).await?;
+    if let Err(error) = ensure_permission(
+        http,
+        guild_id,
+        actor_id,
+        Permissions::MANAGE_ROLES,
+        "You need Manage Roles permission to use the prisoner panel.",
+    )
+    .await
+    {
+        send_ephemeral_followup(
+            http,
+            application_id,
+            interaction,
+            &format!("You cannot use this prisoner panel: {error:#}"),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let requested_page = parts
+        .get(4)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+
+    let action_result: anyhow::Result<()> = async {
+        match action {
+            "page" => {
+                let page = crate::prisoner_ui::page(http, pool, guild_id, actor_id, requested_page)
+                    .await?;
+                edit_deferred_prisoner_page(http, application_id, interaction, page).await?;
+            }
+            "choose_page" => {
+                let selected_page = values
+                    .first()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let page =
+                    crate::prisoner_ui::page(http, pool, guild_id, actor_id, selected_page).await?;
+                edit_deferred_prisoner_page(http, application_id, interaction, page).await?;
+            }
+            "inspect" | "release" => {
+                let page = crate::prisoner_ui::page(http, pool, guild_id, actor_id, requested_page)
+                    .await?;
+                if page.records.is_empty() {
+                    send_ephemeral_followup(
+                        http,
+                        application_id,
+                        interaction,
+                        "There are no active prisoners on this page.",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let title = if action == "inspect" {
+                    "inspect"
+                } else {
+                    "release"
+                };
+                let embed = crate::prisoner_ui::selection_embed(
+                    title,
+                    page.page,
+                    page.page_count,
+                    page.total,
+                );
+                let mut embeds = page.embeds;
+                if let Some(header) = embeds.first_mut() {
+                    *header = embed;
+                }
+                let components = crate::prisoner_ui::selection_components(
+                    guild_id,
+                    actor_id,
+                    page.page,
+                    title,
+                    &page.records,
+                    &page.names,
+                );
+                edit_deferred_prisoner_panel(
+                    http,
+                    application_id,
+                    interaction,
+                    embeds,
+                    components,
+                    page.attachments,
+                )
+                .await?;
+            }
+            "select_inspect" | "select_release" => {
+                let Some(raw_user_id) = values.first() else {
+                    send_ephemeral_followup(
+                        http,
+                        application_id,
+                        interaction,
+                        "Choose a prisoner from the menu first.",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let target_id = match raw_user_id.parse::<u64>() {
+                    Ok(id) => Id::<UserMarker>::new(id),
+                    Err(_) => {
+                        send_ephemeral_followup(
+                            http,
+                            application_id,
+                            interaction,
+                            "That prisoner selection is invalid.",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let page = crate::prisoner_ui::page(http, pool, guild_id, actor_id, requested_page)
+                    .await?;
+                let Some(index) = page
+                    .records
+                    .iter()
+                    .position(|record| record.user_id == target_id.get().to_string())
+                else {
+                    send_ephemeral_followup(
+                        http,
+                        application_id,
+                        interaction,
+                        "That member is no longer on this prisoner page.",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                if action == "select_inspect" {
+                    let embeds =
+                        crate::prisoner_ui::inspection_embeds(http, pool, guild_id, target_id)
+                            .await?;
+                    let components = crate::prisoner_ui::inspect_components(
+                        guild_id, actor_id, page.page, target_id,
+                    );
+                    edit_deferred_prisoner_panel(
+                        http,
+                        application_id,
+                        interaction,
+                        embeds,
+                        components,
+                        crate::prisoner_ui::terminal_attachment(),
+                    )
+                    .await?;
+                } else {
+                    let record = &page.records[index];
+                    let (display_name, avatar) =
+                        crate::prisoner_ui::profile(http, guild_id, target_id).await;
+                    let embeds =
+                        crate::prisoner_ui::confirm_release_embeds(record, &display_name, &avatar);
+                    let components = crate::prisoner_ui::confirmation_components(
+                        guild_id, actor_id, page.page, target_id,
+                    );
+                    edit_deferred_prisoner_panel(
+                        http,
+                        application_id,
+                        interaction,
+                        embeds,
+                        components,
+                        crate::prisoner_ui::terminal_attachment(),
+                    )
+                    .await?;
+                }
+            }
+            "release_selected" => {
+                let Some(target_id) = parts.get(5).and_then(|value| value.parse::<u64>().ok())
+                else {
+                    send_ephemeral_followup(
+                        http,
+                        application_id,
+                        interaction,
+                        "That release selection is invalid.",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                show_release_confirmation(
+                    http,
+                    application_id,
+                    interaction,
+                    pool,
+                    guild_id,
+                    actor_id,
+                    Id::new(target_id),
+                    requested_page,
+                )
+                .await?;
+            }
+            "confirm_release" => {
+                let Some(target_id) = parts.get(5).and_then(|value| value.parse::<u64>().ok())
+                else {
+                    send_ephemeral_followup(
+                        http,
+                        application_id,
+                        interaction,
+                        "That release confirmation is invalid.",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let target_id = Id::<UserMarker>::new(target_id);
+                if let Err(error) =
+                    ensure_moderator(http, pool, guild_id, actor_id, target_id).await
+                {
+                    send_ephemeral_followup(
+                        http,
+                        application_id,
+                        interaction,
+                        &format!("You cannot release this member: {error:#}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let config = crate::database::config_repository::get_guild_config(
+                    pool,
+                    &guild_id.to_string(),
+                )
+                .await?;
+                let Some(role_id) = config
+                    .and_then(|config| config.prisoner_role_id)
+                    .and_then(|value| value.parse::<u64>().ok())
+                else {
+                    send_ephemeral_followup(
+                        http,
+                        application_id,
+                        interaction,
+                        "The Prisoner role is not configured.",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                match crate::services::discord_moderation::release_member(
+                    http,
+                    pool,
+                    guild_id,
+                    target_id,
+                    actor_id,
+                    Id::<RoleMarker>::new(role_id),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let page = crate::prisoner_ui::page(
+                            http,
+                            pool,
+                            guild_id,
+                            actor_id,
+                            requested_page,
+                        )
+                        .await?;
+                        edit_deferred_prisoner_page(http, application_id, interaction, page)
+                            .await?;
+                    }
+                    Err(error) => {
+                        send_ephemeral_followup(
+                            http,
+                            application_id,
+                            interaction,
+                            &format!("Could not release member: {error:#}"),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            "back" => {
+                let page = crate::prisoner_ui::page(http, pool, guild_id, actor_id, requested_page)
+                    .await?;
+                edit_deferred_prisoner_page(http, application_id, interaction, page).await?;
+            }
+            _ => {
+                send_ephemeral_followup(
+                    http,
+                    application_id,
+                    interaction,
+                    "That prisoner control is not available.",
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = action_result {
+        send_ephemeral_followup(
+            http,
+            application_id,
+            interaction,
+            &format!("Could not update the prisoner panel: {error:#}"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn show_release_confirmation(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    pool: &SqlitePool,
+    guild_id: Id<GuildMarker>,
+    owner_id: Id<UserMarker>,
+    target_id: Id<UserMarker>,
+    requested_page: usize,
+) -> anyhow::Result<()> {
+    let page = crate::prisoner_ui::page(http, pool, guild_id, owner_id, requested_page).await?;
+    let Some(record) = page
+        .records
+        .iter()
+        .find(|record| record.user_id == target_id.get().to_string())
+    else {
+        send_ephemeral_followup(
+            http,
+            application_id,
+            interaction,
+            "That member is no longer on this prisoner page.",
+        )
+        .await?;
+        return Ok(());
+    };
+    let (display_name, avatar) = crate::prisoner_ui::profile(http, guild_id, target_id).await;
+    let embeds = crate::prisoner_ui::confirm_release_embeds(record, &display_name, &avatar);
+    let components =
+        crate::prisoner_ui::confirmation_components(guild_id, owner_id, page.page, target_id);
+    edit_deferred_prisoner_panel(
+        http,
+        application_id,
+        interaction,
+        embeds,
+        components,
+        crate::prisoner_ui::terminal_attachment(),
+    )
+    .await
+}
+
+async fn edit_deferred_prisoner_panel(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    embeds: Vec<twilight_model::channel::message::Embed>,
+    components: Vec<Component>,
+    attachments: Vec<twilight_model::http::attachment::Attachment>,
+) -> anyhow::Result<()> {
+    ratelimit::guard(
+        Lane::Message,
+        http.interaction(application_id)
+            .update_response(&interaction.token)
+            .embeds(Some(&embeds))
+            .components(Some(&components))
+            .attachments(&attachments)
+            .content(None),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn quarantine_view(
     pool: &SqlitePool,
     guild_id: Id<GuildMarker>,
@@ -2026,6 +2416,30 @@ async fn defer_interaction(
     Ok(())
 }
 
+async fn defer_ephemeral_interaction(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+) -> anyhow::Result<()> {
+    let response = InteractionResponse {
+        kind: InteractionResponseType::DeferredChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    };
+    ratelimit::guard(
+        Lane::Interaction,
+        http.interaction(application_id).create_response(
+            interaction.id,
+            &interaction.token,
+            &response,
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn edit_deferred_response(
     http: &HttpClient,
     application_id: Id<ApplicationMarker>,
@@ -2076,6 +2490,25 @@ async fn edit_deferred_response_embed(
     )
     .await?;
 
+    Ok(())
+}
+
+async fn edit_deferred_prisoner_page(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    page: crate::prisoner_ui::PrisonerPage,
+) -> anyhow::Result<()> {
+    ratelimit::guard(
+        Lane::Message,
+        http.interaction(application_id)
+            .update_response(&interaction.token)
+            .embeds(Some(&page.embeds))
+            .components(Some(&page.components))
+            .attachments(&page.attachments)
+            .content(None),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2138,11 +2571,27 @@ async fn ensure_moderator(
         bail!("You need the configured Moderator role to jail or release members.");
     }
 
-    let mut target_highest = 0_i64;
-
-    for role_id in &target.roles {
-        if let Some(role) = roles.iter().find(|role| role.id == *role_id) {
-            target_highest = target_highest.max(role.position);
+    let saved_target_highest = if let Some(record) = crate::database::repository::get_active_jail(
+        pool,
+        &guild_id.to_string(),
+        &target_id.to_string(),
+    )
+    .await?
+    {
+        crate::database::repository::get_saved_roles(pool, record.id)
+            .await?
+            .iter()
+            .map(|role| role.role_position)
+            .max()
+    } else {
+        None
+    };
+    let mut target_highest = saved_target_highest.unwrap_or(0);
+    if saved_target_highest.is_none() {
+        for role_id in &target.roles {
+            if let Some(role) = roles.iter().find(|role| role.id == *role_id) {
+                target_highest = target_highest.max(role.position);
+            }
         }
     }
 

@@ -157,7 +157,7 @@ pub fn help() -> Embed {
         "📘 Bot commands".to_owned(),
         Some("Use the buttons on bot messages to open this guide or the GitHub changelog. Configuration commands require the server owner or an administrator.".to_owned()),
         vec![
-            EmbedField { inline: false, name: "Jail moderation".to_owned(), value: "`/jail member [duration] [reason]` - Jail a lower-ranked member.\n`/unjail member` - Release a jailed member.\n`/prisoners` - List active jail records.\n`/jailinfo member` - View jail history.".to_owned() },
+            EmbedField { inline: false, name: "Jail moderation".to_owned(), value: "`/jail member [duration] [reason]` - Jail a lower-ranked member.\n`/unjail member` - Release a jailed member.\n`/prisoner list` - Browse, inspect, and release prisoners.\n`/jailinfo member` - View jail history.".to_owned() },
             EmbedField { inline: false, name: "Configuration".to_owned(), value: "`/jailsetup` - Create the Prisoner role.\n`/setjail channel` - Set the jail channel and permissions.\n`/set moderator role` - Set who can jail lower-ranked members.\n`/setlogs channel` - Set the audit log channel.\n`/jailconfig` - View jail configuration.\n`/sanitize` - Repair Prisoner permissions in every channel.".to_owned() },
             EmbedField { inline: false, name: "Quarantine".to_owned(), value: "`/quarantine` - Turn quarantine on or off and open its status page.\n`/enable module` and `/disable module` - Change a protection module.\nThe Configure button opens one-click module controls.".to_owned() },
             EmbedField { inline: true, name: "Info".to_owned(), value: "`/help` - Show this guide.\n`/changelog` - View GitHub commits and versions.\n`/ping` - Check bot status.".to_owned() },

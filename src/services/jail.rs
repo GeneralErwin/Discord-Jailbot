@@ -100,10 +100,6 @@ impl JailService {
         repository::get_active_jail(&self.pool, guild_id, user_id).await
     }
 
-    pub async fn list_prisoners(&self, guild_id: &str) -> anyhow::Result<Vec<JailRecord>> {
-        repository::list_active_jails(&self.pool, guild_id).await
-    }
-
     /// Records a member leaving while their jail record remains active.
     pub async fn member_left(&self, guild_id: &str, user_id: &str) -> anyhow::Result<bool> {
         let changed = repository::mark_left_server(&self.pool, guild_id, user_id).await?;

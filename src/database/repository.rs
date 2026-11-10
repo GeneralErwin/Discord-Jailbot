@@ -114,7 +114,7 @@ pub async fn get_active_jail(
     Ok(record)
 }
 
-/// Retrieves all active prisoners in a server.
+/// Retrieves all active prisoners for reconciliation and administrative reports.
 pub async fn list_active_jails(
     pool: &SqlitePool,
     guild_id: &str,
@@ -122,11 +122,46 @@ pub async fn list_active_jails(
     let records = sqlx::query_as::<_, JailRecord>(
         "SELECT * FROM jail_records
          WHERE guild_id = ? AND status = 'active'
-         ORDER BY jailed_at ASC",
+         ORDER BY jailed_at ASC, id ASC",
     )
     .bind(guild_id)
     .fetch_all(pool)
-    .await?;
+    .await
+    .context("Failed to retrieve active prisoners")?;
+
+    Ok(records)
+}
+
+pub async fn count_active_jails(pool: &SqlitePool, guild_id: &str) -> anyhow::Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM jail_records WHERE guild_id = ? AND status = 'active'",
+    )
+    .bind(guild_id)
+    .fetch_one(pool)
+    .await
+    .context("Failed to count active prisoners")?;
+
+    Ok(count)
+}
+
+pub async fn list_active_jails_page(
+    pool: &SqlitePool,
+    guild_id: &str,
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<JailRecord>> {
+    let records = sqlx::query_as::<_, JailRecord>(
+        "SELECT * FROM jail_records
+         WHERE guild_id = ? AND status = 'active'
+         ORDER BY jailed_at ASC, id ASC
+         LIMIT ? OFFSET ?",
+    )
+    .bind(guild_id)
+    .bind(limit.clamp(1, 25))
+    .bind(offset.max(0))
+    .fetch_all(pool)
+    .await
+    .context("Failed to retrieve a page of active prisoners")?;
 
     Ok(records)
 }

@@ -37,6 +37,17 @@ pub struct SetLogsCommand {
 pub struct PrisonersCommand;
 
 #[derive(CommandModel, CreateCommand)]
+#[command(name = "prisoner", desc = "Inspect or release jailed members")]
+pub enum PrisonerCommand {
+    #[command(name = "list")]
+    List(PrisonerListCommand),
+}
+
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "list", desc = "Browse the current prisoner roster")]
+pub struct PrisonerListCommand;
+
+#[derive(CommandModel, CreateCommand)]
 #[command(name = "jailinfo", desc = "View a member's jail information")]
 pub struct JailInfoCommand {
     /// The member whose jail information you want to view.

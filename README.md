@@ -19,7 +19,7 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 | `/unjail` | Configured Moderator role, or owner | Release a lower-ranked member and restore their previous state. |
 | `/set moderator role` | Administrator or owner | Choose who may jail members below their highest role. |
 | `/setlogs` | Administrator or owner | Set the moderation log channel. |
-| `/prisoners` | Manage Roles | List the server's current prisoners. |
+| `/prisoner list` (`/prisoners` alias) | Manage Roles | Browse, inspect, and release jailed members with a paginated XP-style terminal panel. |
 | `/jailinfo` | Manage Roles | Show a member's jail history. |
 | `/jailconfig` | Administrator or owner | Show the server's jail configuration. |
 | `/sanitize` | Administrator or owner | Scan channels and repair incorrect `Prisoner` role permissions. |
@@ -34,6 +34,7 @@ Command replies and moderation logs use branded embeds with navigation buttons. 
 ### Jail state
 
 - One active sentence per member per server, enforced by a partial unique index.
+- `/prisoner list` opens a private, paginated XP-style roster with member avatars, arrest reason, arrest time and expiry. Inspect opens the saved jail record and role/permission snapshots; Release opens a confirmation prompt. The legacy `/prisoners` command remains as an alias.
 - Original roles (with positions and restore flags) and nickname are saved before anything changes.
 - Restrictions are applied through the **Prisoner role** alone, so jailing costs a handful of API calls instead of one per channel. Outside the jail channel the role denies viewing, sending, thread replies, thread creation and reactions; inside it the role may only read and send plain text. Legacy records that still hold member overwrites are restored on release.
 - The database record is written **before** Discord is modified, and a release is only marked complete **after** roles, nickname and overwrites are restored. A crash in the middle leaves a record that the next repair pass finishes.
