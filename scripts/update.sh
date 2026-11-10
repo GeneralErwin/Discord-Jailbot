@@ -21,8 +21,11 @@ if [ -f data/jail.sqlite3 ]; then
 fi
 
 # Find the PM2 process already running this binary, so the process name never
-# has to be guessed. Prints the name, __AMBIGUOUS__:<names> if several
-# processes run the bot, or nothing when there is no safe choice.
+# has to be guessed. Prints:
+#   <name>              exactly one process runs the bot
+#   __AMBIGUOUS__:<...> several processes run the bot (duplicate instances)
+#   __FALLBACK__:<name> no match, but PM2 holds exactly one app
+#   (nothing)           no safe choice
 find_app() {
   local json matches names count
   json=$(pm2 jlist 2>/dev/null || true)
@@ -40,15 +43,13 @@ find_app() {
     printf '__AMBIGUOUS__:%s' "$matches"
     return
   fi
-  # No process runs the bot. Only fall back when the whole PM2 list is a
-  # single app, so an unrelated service never gets restarted by mistake.
   names=$(printf '%s' "$json" \
     | sed 's/},{/}\n{/g' \
     | grep -o '"name":"[^"]*"' \
     | cut -d'"' -f4 | sort -u || true)
   count=$(printf '%s\n' "$names" | grep -c . || true)
   if [ "$count" -eq 1 ]; then
-    printf '%s' "$names"
+    printf '__FALLBACK__:%s' "$names"
   fi
 }
 
@@ -75,6 +76,11 @@ case "$app" in
     printf '%s\n' "${app#__AMBIGUOUS__:}" >&2
     echo "Duplicate instances share one gateway token - stop all but one, then run this again." >&2
     exit 1
+    ;;
+  __FALLBACK__:*)
+    app=${app#__FALLBACK__:}
+    echo "Warning: no PM2 process points at $bin." >&2
+    echo "Restarting the only registered app instead: $app" >&2
     ;;
 esac
 
