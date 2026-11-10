@@ -218,6 +218,14 @@ bash scripts/deploy.sh user@yourserver /opt/jailbot
 
 It sends a single compressed stream (about a hundred kilobytes) and finishes with `cargo build --release` plus `pm2 restart jailbot`.
 
+If the source is already on the server (pulled or copied), rebuild there. Rust has to be recompiled after any source change — `pm2 restart` on its own only re-launches the previous binary:
+
+```bash
+bash scripts/update.sh
+```
+
+It backs up `data/jail.sqlite3`, runs `cargo build --release`, checks the binary was actually rewritten, restarts the PM2 process and prints the latest log lines.
+
 If the server can reach GitHub, skip the upload entirely:
 
 ```bash
