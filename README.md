@@ -29,6 +29,8 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 | `/changelog` | Everyone | Show recent changes. |
 | `/ping` | Everyone | Check whether the bot is responding. |
 
+Command replies and moderation logs use branded embeds with navigation buttons. Jail confirmations and jail audit entries include a **Release member** button; only the configured moderator role (or the owner) can use it, subject to the same role hierarchy check as `/unjail`.
+
 ### Jail state
 
 - One active sentence per member per server, enforced by a partial unique index.
@@ -46,7 +48,7 @@ A Discord moderation bot written in **Rust**, using Twilight and SQLite. Designe
 
 ### Quarantine service
 
-Run `/quarantine` as the server owner or an administrator to turn the service on. On first activation all seven modules start enabled; `/quarantine` also displays their states with a green check or red X. Use `/enable module` and `/disable module` with one of the module names in that embed to change individual protections. Run `/quarantine` again to pause the full service.
+Run `/quarantine` as the server owner or an administrator to turn the service on. On first activation all seven modules start enabled. The status embed uses a green check or red X for each module; **Configure modules** opens the one-click toggles. You can also use `/enable module` and `/disable module`. Running `/quarantine` again pauses the full service.
 
 - Dangerous role grants and removals are reversed when the affected role has moderation permissions, then the audit-log actor is jailed.
 - Dangerous role permission changes are reset to the old permission set. Dangerous channel overwrites are restored from the audit log.
@@ -54,6 +56,10 @@ Run `/quarantine` as the server owner or an administrator to turn the service on
 - A channel deletion quarantines and logs the actor. Discord does not let the bot restore the deleted channel's original ID or messages.
 - Three webhook creations within 30 seconds, or a webhook mass mention, trigger containment: delete all guild webhooks and remove `Manage Webhooks` from roles and channel overwrites.
 - Automatic quarantine jailing requires `/jailsetup` and `/setjail`. If the bot lacks hierarchy or API permissions to reverse an action, the failure is logged and the bot reports the failed step.
+
+### GitHub changelog
+
+`/changelog` reads commit history from the configured GitHub repository and refreshes automatically on startup and every five minutes. The first commit in the repository history is version `1.0`; each regular commit advances the minor number (`1.1`, `1.2`, ...). A commit whose subject starts with `major:` or `major(`, uses a breaking `!:` marker (for example `feat!:`), or includes `BREAKING CHANGE` advances to the next major version (`2.0`). The full commit message is shown as the release description.
 
 ### Safety limits
 
@@ -102,6 +108,10 @@ Create a `.env` file in the project root:
 
 ```env
 DISCORD_TOKEN=YOUR_BOT_TOKEN
+# Optional: defaults to GeneralErwin/Discord-Jailbot
+GITHUB_REPOSITORY=owner/repository
+# Optional for public repos; required for private repos and higher API limits
+GITHUB_TOKEN=YOUR_GITHUB_TOKEN
 ```
 
 **Never publish your bot token or commit your `.env` file.** The `.gitignore` in this repository already excludes `.env`, `data/` and `target/`.

@@ -90,34 +90,6 @@ pub fn find_module_key(input: &str) -> Option<&'static str> {
     })
 }
 
-pub async fn status_message(
-    pool: &SqlitePool,
-    guild_id: Id<GuildMarker>,
-) -> anyhow::Result<String> {
-    let guild_id_string = guild_id.to_string();
-    let config = config_repository::get_guild_config(pool, &guild_id_string).await?;
-    let enabled = config.is_some_and(|config| config.quarantine_enabled);
-    let saved = config_repository::list_quarantine_modules(pool, &guild_id_string).await?;
-
-    let mut message = format!(
-        "**Quarantine service: {}**\n",
-        if enabled { "enabled" } else { "disabled" }
-    );
-    for module in MODULES {
-        let active = saved
-            .iter()
-            .find(|saved| saved.module_key == module.key)
-            .is_some_and(|saved| saved.enabled);
-        let icon = if enabled && active { "✅" } else { "❌" };
-        message.push_str(&format!(
-            "{icon} **{}** — {}\n",
-            module.label, module.description
-        ));
-    }
-    message.push_str("\nUse `/enable module` or `/disable module` to change a module.");
-    Ok(message)
-}
-
 pub async fn handle_audit_entry(
     http: &HttpClient,
     pool: &SqlitePool,

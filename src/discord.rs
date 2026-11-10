@@ -17,6 +17,7 @@ use twilight_interactions::command::{CommandInputData, CommandModel, CreateComma
 use twilight_model::{
     application::interaction::{Interaction, InteractionData},
     channel::ChannelType,
+    channel::message::{Component, MessageFlags},
     channel::permission_overwrite::PermissionOverwriteType as ChannelOverwriteType,
     guild::Permissions,
     http::{
@@ -102,6 +103,16 @@ pub async fn run(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Global slash commands registered"
     );
+
+    let changelog_pool = pool.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = crate::services::github_changelog::sync(&changelog_pool).await {
+                tracing::warn!(?error, "GitHub changelog synchronization failed");
+            }
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    });
 
     let mut shard = Shard::new(
         ShardId::ONE,
@@ -558,8 +569,22 @@ async fn handle_interaction(
     interaction: Interaction,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
-    let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_ref() else {
+    let Some(data) = interaction.data.as_ref() else {
         return Ok(());
+    };
+    let command = match data {
+        InteractionData::MessageComponent(component) => {
+            return handle_component_interaction(
+                http,
+                application_id,
+                &interaction,
+                &component.custom_id,
+                pool,
+            )
+            .await;
+        }
+        InteractionData::ApplicationCommand(command) => command,
+        _ => return Ok(()),
     };
 
     match command.name.as_str() {
@@ -574,13 +599,27 @@ async fn handle_interaction(
         }
 
         "help" => {
-            let message = "**Bot commands**\n`/help` — Show this command list.\n`/changelog` — Show recent changes.\n`/jail member [duration] [reason]` — Jail a member below your moderator role.\n`/unjail member` — Release a member below your moderator role.\n`/prisoners` — List active jail records.\n`/jailinfo member` — View a member's jail history.\n`/jailconfig` — View jail configuration.\n`/jailsetup` — Create or find the Prisoner role.\n`/setjail channel` — Configure the jail channel.\n`/setlogs channel` — Configure the moderation log channel.\n`/set moderator role` — Choose who may jail lower ranked members.\n`/sanitize` — Repair Prisoner role permissions across channels.\n`/quarantine` — Enable or disable the quarantine service.\n`/enable module` and `/disable module` — Toggle individual quarantine protections.\n`/ping` — Check bot status.\n\nConfiguration commands require the server owner or an administrator. Jail actions require the configured moderator role and a lower ranked target.";
-            respond(http, application_id, &interaction, message).await?;
+            respond_embed(
+                http,
+                application_id,
+                &interaction,
+                crate::embeds::help(),
+                crate::embeds::standard_components(),
+            )
+            .await?;
         }
 
         "changelog" => {
-            let message = "**Recent changes**\n• Added `/help` and `/changelog`.\n• Added a configurable quarantine service with per-module controls.\n• Added reversals for dangerous role grants and permission escalations.\n• Added webhook raid containment, moderator-role jail access, and `/sanitize`.";
-            respond(http, application_id, &interaction, message).await?;
+            defer_interaction(http, application_id, &interaction).await?;
+            let (embed, components) = match changelog_page(pool, 0).await {
+                Ok(page) => page,
+                Err(error) => (
+                    crate::embeds::response(&format!("Could not load the changelog: {error:#}")),
+                    crate::embeds::standard_components(),
+                ),
+            };
+            edit_deferred_response_embed(http, application_id, &interaction, embed, components)
+                .await?;
         }
 
         "jailsetup" => {
@@ -777,12 +816,22 @@ async fn handle_interaction(
             }
             .await;
 
-            let message = match result {
-                Ok(message) => message,
-                Err(error) => format!("Could not jail member: {error:#}"),
-            };
-
-            edit_deferred_response(http, application_id, &interaction, &message).await?;
+            match result {
+                Ok(message) => {
+                    edit_deferred_response_with_components(
+                        http,
+                        application_id,
+                        &interaction,
+                        &message,
+                        crate::embeds::jail_release_components(guild_id.get(), target_id.get()),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    let message = format!("Could not jail member: {error:#}");
+                    edit_deferred_response(http, application_id, &interaction, &message).await?;
+                }
+            }
         }
 
         "unjail" => {
@@ -884,7 +933,7 @@ async fn handle_interaction(
             let actor_id = interaction
                 .author_id()
                 .context("Could not identify the user")?;
-            let result: anyhow::Result<String> = async {
+            let result: anyhow::Result<(bool, Vec<(&'static str, &'static str, bool)>)> = async {
                 ensure_admin_or_owner(http, guild_id, actor_id).await?;
                 let guild_string = guild_id.to_string();
                 let config =
@@ -905,14 +954,30 @@ async fn handle_interaction(
                     enabling,
                 )
                 .await?;
-                crate::services::quarantine::status_message(pool, guild_id).await
+                quarantine_view(pool, guild_id).await
             }
             .await;
-            let message = match result {
-                Ok(message) => message,
-                Err(error) => format!("Could not update quarantine: {error:#}"),
-            };
-            respond(http, application_id, &interaction, &message).await?;
+            match result {
+                Ok((service_enabled, modules)) => {
+                    respond_embed(
+                        http,
+                        application_id,
+                        &interaction,
+                        crate::embeds::quarantine_status_embed(service_enabled, &modules),
+                        crate::embeds::quarantine_status_components(guild_id.get()),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    respond(
+                        http,
+                        application_id,
+                        &interaction,
+                        &format!("Could not update quarantine: {error:#}"),
+                    )
+                    .await?;
+                }
+            }
         }
 
         "enable" | "disable" => {
@@ -929,7 +994,7 @@ async fn handle_interaction(
             } else {
                 DisableModuleCommand::from_interaction(input)?.module
             };
-            let result: anyhow::Result<String> = async {
+            let result: anyhow::Result<(bool, Vec<(&'static str, &'static str, bool)>)> = async {
                 ensure_admin_or_owner(http, guild_id, actor_id).await?;
                 let key =
                     crate::services::quarantine::find_module_key(&raw_module).ok_or_else(|| {
@@ -944,29 +1009,30 @@ async fn handle_interaction(
                     enabled,
                 )
                 .await?;
-                let label = crate::services::quarantine::MODULES
-                    .iter()
-                    .find(|module| module.key == key)
-                    .map(|module| module.label)
-                    .unwrap_or(key);
-                let state = crate::database::config_repository::get_guild_config(
-                    pool,
-                    &guild_id.to_string(),
-                )
-                .await?
-                .is_some_and(|config| config.quarantine_enabled);
-                Ok(format!(
-                    "{} **{label}**. Quarantine service is {}.",
-                    if enabled { "Enabled" } else { "Disabled" },
-                    if state { "active" } else { "inactive" }
-                ))
+                quarantine_view(pool, guild_id).await
             }
             .await;
-            let message = match result {
-                Ok(message) => message,
-                Err(error) => format!("Could not change quarantine module: {error:#}"),
-            };
-            respond(http, application_id, &interaction, &message).await?;
+            match result {
+                Ok((service_enabled, modules)) => {
+                    respond_embed(
+                        http,
+                        application_id,
+                        &interaction,
+                        crate::embeds::quarantine_modules_embed(service_enabled, &modules),
+                        crate::embeds::quarantine_module_components(guild_id.get(), &modules),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    respond(
+                        http,
+                        application_id,
+                        &interaction,
+                        &format!("Could not change quarantine module: {error:#}"),
+                    )
+                    .await?;
+                }
+            }
         }
 
         "sanitize" => {
@@ -1426,16 +1492,501 @@ async fn sanitize_jail_permissions(
     Ok(corrected)
 }
 
+async fn handle_component_interaction(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    custom_id: &str,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    match custom_id {
+        "bot:help" => {
+            return respond_component_ephemeral_embed(
+                http,
+                application_id,
+                interaction,
+                crate::embeds::help(),
+                crate::embeds::standard_components(),
+            )
+            .await;
+        }
+        "bot:changelog" => match changelog_page(pool, 0).await {
+            Ok((embed, components)) => {
+                return respond_component_ephemeral_embed(
+                    http,
+                    application_id,
+                    interaction,
+                    embed,
+                    components,
+                )
+                .await;
+            }
+            Err(error) => {
+                return respond_component_ephemeral(
+                    http,
+                    application_id,
+                    interaction,
+                    &format!("Could not load the changelog: {error:#}"),
+                )
+                .await;
+            }
+        },
+        _ => {}
+    }
+
+    if custom_id.starts_with("changelog:page:") {
+        let offset = custom_id
+            .strip_prefix("changelog:page:")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        match changelog_page(pool, offset).await {
+            Ok((embed, components)) => {
+                return update_component_message(
+                    http,
+                    application_id,
+                    interaction,
+                    embed,
+                    components,
+                )
+                .await;
+            }
+            Err(error) => {
+                return respond_component_ephemeral(
+                    http,
+                    application_id,
+                    interaction,
+                    &format!("Could not load the changelog: {error:#}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    if custom_id.starts_with("quarantine:") {
+        let mut parts = custom_id.splitn(4, ':');
+        let _ = parts.next();
+        let action = parts.next().unwrap_or_default();
+        let expected_guild_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+        let Some(guild_id) = interaction.guild_id else {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                "Quarantine controls can only be used in a server.",
+            )
+            .await;
+        };
+        if expected_guild_id != Some(guild_id.get()) {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                "This control belongs to a different server.",
+            )
+            .await;
+        }
+        let actor_id = interaction
+            .author_id()
+            .context("Could not identify the user")?;
+        if let Err(error) = ensure_admin_or_owner(http, guild_id, actor_id).await {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                &format!("You cannot configure quarantine: {error:#}"),
+            )
+            .await;
+        }
+
+        let module_key = if action == "toggle" {
+            parts
+                .next()
+                .and_then(crate::services::quarantine::find_module_key)
+        } else {
+            None
+        };
+        if action == "toggle" && module_key.is_none() {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                "That quarantine module is not available.",
+            )
+            .await;
+        }
+        if !matches!(action, "configure" | "status" | "toggle") {
+            return Ok(());
+        }
+
+        defer_component_update(http, application_id, interaction).await?;
+        let result: anyhow::Result<(twilight_model::channel::message::Embed, Vec<Component>)> =
+            async {
+                if let Some(key) = module_key {
+                    let enabled = crate::database::config_repository::quarantine_module_enabled(
+                        pool,
+                        &guild_id.to_string(),
+                        key,
+                    )
+                    .await?;
+                    crate::database::config_repository::set_quarantine_module(
+                        pool,
+                        &guild_id.to_string(),
+                        key,
+                        !enabled,
+                    )
+                    .await?;
+                }
+                let (service_enabled, modules) = quarantine_view(pool, guild_id).await?;
+                if action == "configure" {
+                    Ok((
+                        crate::embeds::quarantine_modules_embed(service_enabled, &modules),
+                        crate::embeds::quarantine_module_components(guild_id.get(), &modules),
+                    ))
+                } else if action == "status" {
+                    Ok((
+                        crate::embeds::quarantine_status_embed(service_enabled, &modules),
+                        crate::embeds::quarantine_status_components(guild_id.get()),
+                    ))
+                } else {
+                    Ok((
+                        crate::embeds::quarantine_modules_embed(service_enabled, &modules),
+                        crate::embeds::quarantine_module_components(guild_id.get(), &modules),
+                    ))
+                }
+            }
+            .await;
+        match result {
+            Ok((embed, components)) => {
+                edit_deferred_response_embed(http, application_id, interaction, embed, components)
+                    .await
+            }
+            Err(error) => {
+                edit_deferred_response(
+                    http,
+                    application_id,
+                    interaction,
+                    &format!("Could not update quarantine controls: {error:#}"),
+                )
+                .await
+            }
+        }?;
+        return Ok(());
+    }
+
+    if let Some(rest) = custom_id.strip_prefix("jail:release:") {
+        let mut ids = rest.split(':');
+        let expected_guild_id = ids.next().and_then(|value| value.parse::<u64>().ok());
+        let target_id = ids.next().and_then(|value| value.parse::<u64>().ok());
+        let Some(guild_id) = interaction.guild_id else {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                "Jail controls can only be used in a server.",
+            )
+            .await;
+        };
+        if expected_guild_id != Some(guild_id.get()) || target_id.is_none() || ids.next().is_some()
+        {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                "This release control is invalid or belongs to another server.",
+            )
+            .await;
+        }
+        let target_id = Id::<UserMarker>::new(target_id.unwrap_or_default());
+        let moderator_id = interaction
+            .author_id()
+            .context("Could not identify the moderator")?;
+        if let Err(error) = ensure_moderator(http, pool, guild_id, moderator_id, target_id).await {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                &format!("You cannot release this member: {error:#}"),
+            )
+            .await;
+        }
+        let config =
+            match crate::database::config_repository::get_guild_config(pool, &guild_id.to_string())
+                .await
+            {
+                Ok(Some(config)) => config,
+                Ok(None) => {
+                    return respond_component_ephemeral(
+                        http,
+                        application_id,
+                        interaction,
+                        "Jail configuration is missing; ask an administrator to run `/jailsetup`.",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return respond_component_ephemeral(
+                        http,
+                        application_id,
+                        interaction,
+                        &format!("Could not load jail configuration: {error:#}"),
+                    )
+                    .await;
+                }
+            };
+        let Some(role_id) = config
+            .prisoner_role_id
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return respond_component_ephemeral(
+                http,
+                application_id,
+                interaction,
+                "The Prisoner role is not configured.",
+            )
+            .await;
+        };
+
+        defer_component_update(http, application_id, interaction).await?;
+        match crate::services::discord_moderation::release_member(
+            http,
+            pool,
+            guild_id,
+            target_id,
+            moderator_id,
+            Id::<RoleMarker>::new(role_id),
+        )
+        .await
+        {
+            Ok(record_id) => {
+                update_deferred_components(
+                    http,
+                    application_id,
+                    interaction,
+                    crate::embeds::standard_components(),
+                )
+                .await?;
+                send_ephemeral_followup(
+                    http,
+                    application_id,
+                    interaction,
+                    &format!(
+                        "Member <@{target_id}> released successfully. Jail record: `{record_id}`"
+                    ),
+                )
+                .await?;
+            }
+            Err(error) => {
+                send_ephemeral_followup(
+                    http,
+                    application_id,
+                    interaction,
+                    &format!("Could not release member: {error:#}"),
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+async fn quarantine_view(
+    pool: &SqlitePool,
+    guild_id: Id<GuildMarker>,
+) -> anyhow::Result<(bool, Vec<(&'static str, &'static str, bool)>)> {
+    let guild_string = guild_id.to_string();
+    let service_enabled = crate::database::config_repository::get_guild_config(pool, &guild_string)
+        .await?
+        .is_some_and(|config| config.quarantine_enabled);
+    let saved =
+        crate::database::config_repository::list_quarantine_modules(pool, &guild_string).await?;
+    let modules = crate::services::quarantine::MODULES
+        .iter()
+        .map(|module| {
+            let enabled = saved
+                .iter()
+                .find(|saved| saved.module_key == module.key)
+                .is_some_and(|saved| saved.enabled);
+            (module.key, module.label, enabled)
+        })
+        .collect();
+    Ok((service_enabled, modules))
+}
+
+async fn changelog_page(
+    pool: &SqlitePool,
+    offset: i64,
+) -> anyhow::Result<(twilight_model::channel::message::Embed, Vec<Component>)> {
+    let offset = offset.clamp(0, 100_000);
+    let entries = crate::database::changelog_repository::recent_entries(pool, 6, offset).await?;
+    let has_older = entries.len() > 5;
+    let embed = if entries.is_empty() {
+        crate::embeds::changelog_empty()
+    } else {
+        crate::embeds::changelog(&entries[..entries.len().min(5)])
+    };
+    Ok((
+        embed,
+        crate::embeds::changelog_components(offset, has_older),
+    ))
+}
+
+async fn update_component_message(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    embed: twilight_model::channel::message::Embed,
+    components: Vec<Component>,
+) -> anyhow::Result<()> {
+    let response = InteractionResponse {
+        kind: InteractionResponseType::UpdateMessage,
+        data: Some(InteractionResponseData {
+            embeds: Some(vec![embed]),
+            components: Some(components),
+            ..Default::default()
+        }),
+    };
+    ratelimit::guard(
+        Lane::Interaction,
+        http.interaction(application_id).create_response(
+            interaction.id,
+            &interaction.token,
+            &response,
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn defer_component_update(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+) -> anyhow::Result<()> {
+    let response = InteractionResponse {
+        kind: InteractionResponseType::DeferredUpdateMessage,
+        data: None,
+    };
+    ratelimit::guard(
+        Lane::Interaction,
+        http.interaction(application_id).create_response(
+            interaction.id,
+            &interaction.token,
+            &response,
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn respond_component_ephemeral(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    message: &str,
+) -> anyhow::Result<()> {
+    respond_component_ephemeral_embed(
+        http,
+        application_id,
+        interaction,
+        crate::embeds::response(message),
+        crate::embeds::standard_components(),
+    )
+    .await
+}
+
+async fn respond_component_ephemeral_embed(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    embed: twilight_model::channel::message::Embed,
+    components: Vec<Component>,
+) -> anyhow::Result<()> {
+    let response = InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            embeds: Some(vec![embed]),
+            components: Some(components),
+            flags: Some(MessageFlags::EPHEMERAL),
+            ..Default::default()
+        }),
+    };
+    ratelimit::guard(
+        Lane::Interaction,
+        http.interaction(application_id).create_response(
+            interaction.id,
+            &interaction.token,
+            &response,
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn update_deferred_components(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    components: Vec<Component>,
+) -> anyhow::Result<()> {
+    ratelimit::guard(
+        Lane::Message,
+        http.interaction(application_id)
+            .update_response(&interaction.token)
+            .components(Some(&components)),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn send_ephemeral_followup(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    message: &str,
+) -> anyhow::Result<()> {
+    let embed = crate::embeds::response(message);
+    ratelimit::guard(
+        Lane::Message,
+        http.interaction(application_id)
+            .create_followup(&interaction.token)
+            .embeds(&[embed])
+            .components(&crate::embeds::standard_components())
+            .flags(MessageFlags::EPHEMERAL),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn respond(
     http: &HttpClient,
     application_id: Id<ApplicationMarker>,
     interaction: &Interaction,
     content: &str,
 ) -> anyhow::Result<()> {
+    respond_embed(
+        http,
+        application_id,
+        interaction,
+        crate::embeds::response(content),
+        crate::embeds::standard_components(),
+    )
+    .await
+}
+
+async fn respond_embed(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    embed: twilight_model::channel::message::Embed,
+    components: Vec<Component>,
+) -> anyhow::Result<()> {
     let response = InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
-            embeds: Some(vec![crate::embeds::response(content)]),
+            embeds: Some(vec![embed]),
+            components: Some(components),
             ..Default::default()
         }),
     };
@@ -1481,12 +2032,46 @@ async fn edit_deferred_response(
     interaction: &Interaction,
     content: &str,
 ) -> anyhow::Result<()> {
-    let embed = crate::embeds::response(content);
+    edit_deferred_response_with_components(
+        http,
+        application_id,
+        interaction,
+        content,
+        crate::embeds::standard_components(),
+    )
+    .await
+}
+
+async fn edit_deferred_response_with_components(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    content: &str,
+    components: Vec<Component>,
+) -> anyhow::Result<()> {
+    edit_deferred_response_embed(
+        http,
+        application_id,
+        interaction,
+        crate::embeds::response(content),
+        components,
+    )
+    .await
+}
+
+async fn edit_deferred_response_embed(
+    http: &HttpClient,
+    application_id: Id<ApplicationMarker>,
+    interaction: &Interaction,
+    embed: twilight_model::channel::message::Embed,
+    components: Vec<Component>,
+) -> anyhow::Result<()> {
     ratelimit::guard(
         Lane::Message,
         http.interaction(application_id)
             .update_response(&interaction.token)
             .embeds(Some(std::slice::from_ref(&embed)))
+            .components(Some(&components))
             .content(None),
     )
     .await?;

@@ -329,11 +329,12 @@ pub async fn jail_member(
         "Member jailed successfully"
     );
 
-    if let Err(error) = send_moderation_log(
+    if let Err(error) = send_moderation_log_with_components(
         http,
         pool,
         guild_id,
         &format!("**Member jailed**\nMember: <@{target_id}>\nModerator: <@{moderator_id}>\nReason: {log_reason}\nRecord: `{record_id}`"),
+        crate::embeds::jail_release_components(guild_id.get(), target_id.get()),
     )
     .await
     {
@@ -541,6 +542,23 @@ pub async fn send_moderation_log(
     guild_id: Id<GuildMarker>,
     message: &str,
 ) -> anyhow::Result<()> {
+    send_moderation_log_with_components(
+        http,
+        pool,
+        guild_id,
+        message,
+        crate::embeds::standard_components(),
+    )
+    .await
+}
+
+pub async fn send_moderation_log_with_components(
+    http: &HttpClient,
+    pool: &SqlitePool,
+    guild_id: Id<GuildMarker>,
+    message: &str,
+    components: Vec<twilight_model::channel::message::Component>,
+) -> anyhow::Result<()> {
     let Some(config) =
         crate::database::config_repository::get_guild_config(pool, &guild_id.to_string()).await?
     else {
@@ -560,7 +578,9 @@ pub async fn send_moderation_log(
     let embed = crate::embeds::moderation_log(message);
     ratelimit::guard(
         Lane::Message,
-        http.create_message(channel_id).embeds(&[embed]),
+        http.create_message(channel_id)
+            .embeds(&[embed])
+            .components(&components),
     )
     .await?;
 

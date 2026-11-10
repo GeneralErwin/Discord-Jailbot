@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use twilight_model::{
+    channel::message::component::{ActionRow, Button, ButtonStyle, Component},
     channel::message::{
         Embed,
         embed::{EmbedField, EmbedFooter},
@@ -22,6 +23,7 @@ pub fn response(message: &str) -> Embed {
         "failed ",
         "setup failed",
         "you need ",
+        "you cannot ",
         "this command can only",
         "cannot ",
     ]
@@ -140,6 +142,260 @@ pub fn moderation_log(message: &str) -> Embed {
         color,
         "Moderation audit \u{2022} Rust Jail",
     )
+}
+
+pub fn standard_components() -> Vec<Component> {
+    action_row(vec![
+        button("bot:help", "Commands", ButtonStyle::Primary, None),
+        button("bot:changelog", "Changelog", ButtonStyle::Secondary, None),
+        button("", "GitHub", ButtonStyle::Link, Some(repository_url())),
+    ])
+}
+
+pub fn help() -> Embed {
+    branded_embed(
+        "📘 Bot commands".to_owned(),
+        Some("Use the buttons on bot messages to open this guide or the GitHub changelog. Configuration commands require the server owner or an administrator.".to_owned()),
+        vec![
+            EmbedField { inline: false, name: "Jail moderation".to_owned(), value: "`/jail member [duration] [reason]` - Jail a lower-ranked member.\n`/unjail member` - Release a jailed member.\n`/prisoners` - List active jail records.\n`/jailinfo member` - View jail history.".to_owned() },
+            EmbedField { inline: false, name: "Configuration".to_owned(), value: "`/jailsetup` - Create the Prisoner role.\n`/setjail channel` - Set the jail channel and permissions.\n`/set moderator role` - Set who can jail lower-ranked members.\n`/setlogs channel` - Set the audit log channel.\n`/jailconfig` - View jail configuration.\n`/sanitize` - Repair Prisoner permissions in every channel.".to_owned() },
+            EmbedField { inline: false, name: "Quarantine".to_owned(), value: "`/quarantine` - Turn quarantine on or off and open its status page.\n`/enable module` and `/disable module` - Change a protection module.\nThe Configure button opens one-click module controls.".to_owned() },
+            EmbedField { inline: true, name: "Info".to_owned(), value: "`/help` - Show this guide.\n`/changelog` - View GitHub commits and versions.\n`/ping` - Check bot status.".to_owned() },
+        ],
+        COLOR_INFO,
+        "Rust Jail System",
+    )
+}
+
+pub fn jail_release_components(guild_id: u64, member_id: u64) -> Vec<Component> {
+    action_row(vec![
+        button(
+            &format!("jail:release:{guild_id}:{member_id}"),
+            "Release member",
+            ButtonStyle::Danger,
+            None,
+        ),
+        button("bot:help", "Commands", ButtonStyle::Primary, None),
+        button("bot:changelog", "Changelog", ButtonStyle::Secondary, None),
+        button("", "GitHub", ButtonStyle::Link, Some(repository_url())),
+    ])
+}
+
+pub fn quarantine_status_components(guild_id: u64) -> Vec<Component> {
+    action_row(vec![
+        button(
+            &format!("quarantine:configure:{guild_id}"),
+            "Configure modules",
+            ButtonStyle::Primary,
+            None,
+        ),
+        button("bot:help", "Commands", ButtonStyle::Secondary, None),
+        button("bot:changelog", "Changelog", ButtonStyle::Secondary, None),
+        button("", "GitHub", ButtonStyle::Link, Some(repository_url())),
+    ])
+}
+
+pub fn quarantine_module_components(
+    guild_id: u64,
+    modules: &[(&str, &str, bool)],
+) -> Vec<Component> {
+    let mut rows = Vec::new();
+    for group in modules.chunks(5) {
+        let buttons = group
+            .iter()
+            .map(|(key, label, enabled)| {
+                let action = if *enabled { "Disable" } else { "Enable" };
+                let style = if *enabled {
+                    ButtonStyle::Danger
+                } else {
+                    ButtonStyle::Success
+                };
+                button(
+                    &format!("quarantine:toggle:{guild_id}:{key}"),
+                    &format!("{action}: {label}"),
+                    style,
+                    None,
+                )
+            })
+            .collect();
+        rows.extend(action_row(buttons));
+    }
+    rows.extend(action_row(vec![
+        button(
+            &format!("quarantine:status:{guild_id}"),
+            "Back to status",
+            ButtonStyle::Secondary,
+            None,
+        ),
+        button("bot:help", "Commands", ButtonStyle::Secondary, None),
+        button("bot:changelog", "Changelog", ButtonStyle::Secondary, None),
+        button("", "GitHub", ButtonStyle::Link, Some(repository_url())),
+    ]));
+    rows
+}
+
+pub fn changelog_components(offset: i64, has_older: bool) -> Vec<Component> {
+    let mut buttons = Vec::new();
+    if offset > 0 {
+        buttons.push(button(
+            &format!("changelog:page:{}", (offset - 5).max(0)),
+            "Newer",
+            ButtonStyle::Primary,
+            None,
+        ));
+    }
+    if has_older {
+        buttons.push(button(
+            &format!("changelog:page:{}", offset + 5),
+            "Older",
+            ButtonStyle::Primary,
+            None,
+        ));
+    }
+    buttons.push(button("bot:help", "Commands", ButtonStyle::Secondary, None));
+    buttons.push(button(
+        "",
+        "GitHub",
+        ButtonStyle::Link,
+        Some(repository_url()),
+    ));
+    action_row(buttons)
+}
+
+pub fn changelog(entries: &[crate::database::changelog_repository::ChangelogEntry]) -> Embed {
+    let mut fields = Vec::new();
+    for entry in entries.iter().take(5) {
+        let date = entry.committed_at.get(..10).unwrap_or(&entry.committed_at);
+        let first_line = entry
+            .message
+            .lines()
+            .next()
+            .unwrap_or("Commit message unavailable");
+        let body = entry.message.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let value = format!(
+            "{}{}\n[`{}`]({})",
+            first_line,
+            if body.is_empty() {
+                String::new()
+            } else {
+                format!("\n{body}")
+            },
+            &entry.sha[..entry.sha.len().min(7)],
+            entry.html_url,
+        );
+        fields.push(EmbedField {
+            inline: false,
+            name: truncate(
+                &format!("v{}.{} | {date}", entry.version_major, entry.version_minor),
+                256,
+            ),
+            value: truncate(&value, 1024),
+        });
+    }
+
+    branded_embed(
+        "📜 GitHub changelog".to_owned(),
+        Some("Commit messages are the release descriptions. Regular changes advance the second version number; commits marked `major:`, with a breaking `!:` subject, or containing `BREAKING CHANGE` advance the major version.".to_owned()),
+        fields,
+        COLOR_INFO,
+        "Version history from GitHub",
+    )
+}
+
+pub fn quarantine_modules_embed(service_enabled: bool, modules: &[(&str, &str, bool)]) -> Embed {
+    let fields = modules
+        .iter()
+        .map(|(key, label, enabled)| {
+            let description = crate::services::quarantine::MODULES
+                .iter()
+                .find(|module| module.key == *key)
+                .map(|module| module.description)
+                .unwrap_or("Quarantine protection module.");
+            let state = if !service_enabled && *enabled {
+                "Enabled, but paused while the service is off"
+            } else if *enabled {
+                "Module enabled"
+            } else {
+                "Module disabled"
+            };
+            EmbedField {
+                inline: false,
+                name: format!("{} {label}", if *enabled { "✅" } else { "❌" }),
+                value: format!("{state}\n{description}"),
+            }
+        })
+        .collect();
+    branded_embed(
+        format!(
+            "{} Quarantine modules",
+            if service_enabled { "🛡️" } else { "⏸️" }
+        ),
+        Some(format!(
+            "Service is **{}**. Click a module button below to switch it.",
+            if service_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )),
+        fields,
+        if service_enabled {
+            COLOR_INFO
+        } else {
+            COLOR_WARNING
+        },
+        "Rust Jail System | interactive configuration",
+    )
+}
+
+pub fn quarantine_status_embed(service_enabled: bool, modules: &[(&str, &str, bool)]) -> Embed {
+    let mut embed = quarantine_modules_embed(service_enabled, modules);
+    embed.description = Some(format!(
+        "Quarantine is **{}**. Open Configure to turn individual protections on or off.",
+        if service_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+    embed.title = Some("🛡️ Quarantine status".to_owned());
+    embed
+}
+
+pub fn changelog_empty() -> Embed {
+    branded_embed(
+        "📜 GitHub changelog".to_owned(),
+        Some("No commits have been synchronized yet. The bot checks GitHub on startup and every five minutes.".to_owned()),
+        Vec::new(),
+        COLOR_INFO,
+        "Version history from GitHub",
+    )
+}
+
+fn repository_url() -> String {
+    let repo = std::env::var("GITHUB_REPOSITORY")
+        .unwrap_or_else(|_| "GeneralErwin/Discord-Jailbot".to_owned());
+    format!("https://github.com/{repo}")
+}
+
+fn action_row(buttons: Vec<Button>) -> Vec<Component> {
+    vec![Component::ActionRow(ActionRow {
+        components: buttons.into_iter().map(Component::Button).collect(),
+        id: None,
+    })]
+}
+
+fn button(custom_id: &str, label: &str, style: ButtonStyle, url: Option<String>) -> Button {
+    Button {
+        custom_id: (!custom_id.is_empty()).then(|| custom_id.to_owned()),
+        disabled: false,
+        emoji: None,
+        id: None,
+        label: Some(label.to_owned()),
+        sku_id: None,
+        style,
+        url,
+    }
 }
 
 fn response_heading(heading: &str) -> String {
